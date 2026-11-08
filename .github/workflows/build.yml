@@ -26,8 +26,8 @@ jobs:
                   applicationId "vn.compass.app"
                   minSdk 26
                   targetSdk 34
-                  versionCode 1
-                  versionName "1.0"
+                  versionCode 2
+                  versionName "1.1"
               }
 
               signingConfigs {
@@ -65,6 +65,7 @@ jobs:
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
               <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.INTERNET" />
 
               <uses-feature
                   android:name="android.hardware.sensor.compass"
@@ -91,6 +92,274 @@ jobs:
                   </activity>
               </application>
           </manifest>
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/Coord.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.floor
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+          import kotlin.math.tan
+
+          enum class CoordFmt(val label: String) {
+              DD("Độ thập phân"),
+              DDM("Độ + phút thập phân"),
+              DMS("Độ phút giây"),
+              UTM("UTM"),
+              MGRS("MGRS")
+          }
+
+          class Utm(val zone: Int, val band: Char, val easting: Double, val northing: Double)
+
+          object Coord {
+              private const val BANDS = "CDEFGHJKLMNPQRSTUVWX"
+
+              private fun hemi(v: Double, isLat: Boolean) =
+                  if (isLat) (if (v >= 0) "B" else "N") else (if (v >= 0) "Đ" else "T")
+
+              private fun dec(v: Double, n: Int) = String.format(Locale.US, "%." + n + "f", v).replace('.', ',')
+
+              fun toUtm(lat: Double, lon: Double): Utm {
+                  val a = 6378137.0
+                  val f = 1.0 / 298.257223563
+                  val k0 = 0.9996
+                  val zone = (floor((lon + 180.0) / 6.0).toInt() + 1).coerceIn(1, 60)
+                  val lon0 = Math.toRadians((zone - 1) * 6.0 - 180.0 + 3.0)
+                  val phi = Math.toRadians(lat)
+                  val lam = Math.toRadians(lon)
+                  val e2 = f * (2.0 - f)
+                  val ep2 = e2 / (1.0 - e2)
+                  val sp = sin(phi)
+                  val cp = cos(phi)
+                  val n = a / sqrt(1.0 - e2 * sp * sp)
+                  val t = tan(phi) * tan(phi)
+                  val c = ep2 * cp * cp
+                  val aa = cp * (lam - lon0)
+                  val e4 = e2 * e2
+                  val e6 = e4 * e2
+                  val m = a * ((1.0 - e2 / 4.0 - 3.0 * e4 / 64.0 - 5.0 * e6 / 256.0) * phi -
+                      (3.0 * e2 / 8.0 + 3.0 * e4 / 32.0 + 45.0 * e6 / 1024.0) * sin(2.0 * phi) +
+                      (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * sin(4.0 * phi) -
+                      (35.0 * e6 / 3072.0) * sin(6.0 * phi))
+                  val a2 = aa * aa
+                  val a3 = a2 * aa
+                  val a4 = a2 * a2
+                  val a5 = a4 * aa
+                  val a6 = a4 * a2
+                  val easting = k0 * n * (aa + (1.0 - t + c) * a3 / 6.0 +
+                      (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * ep2) * a5 / 120.0) + 500000.0
+                  var northing = k0 * (m + n * tan(phi) * (a2 / 2.0 +
+                      (5.0 - t + 9.0 * c + 4.0 * c * c) * a4 / 24.0 +
+                      (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * ep2) * a6 / 720.0))
+                  if (lat < 0) northing += 10000000.0
+                  val bi = floor((lat + 80.0) / 8.0).toInt().coerceIn(0, 19)
+                  return Utm(zone, BANDS[bi], easting, northing)
+              }
+
+              fun mgrs(lat: Double, lon: Double): String {
+                  val u = toUtm(lat, lon)
+                  val sets = arrayOf("ABCDEFGH", "JKLMNPQR", "STUVWXYZ")
+                  val set = (u.zone - 1) % 3
+                  val ci = (floor(u.easting / 100000.0).toInt() - 1).coerceIn(0, 7)
+                  val rowLetters = "ABCDEFGHJKLMNPQRSTUV"
+                  var ri = floor(u.northing / 100000.0).toInt() % 20
+                  if (u.zone % 2 == 0) ri = (ri + 5) % 20
+                  val e5 = floor(u.easting % 100000.0).toInt()
+                  val n5 = floor(u.northing % 100000.0).toInt()
+                  return String.format(Locale.US, "%d%c %c%c %05d %05d", u.zone, u.band, sets[set][ci], rowLetters[ri], e5, n5)
+              }
+
+              /** Trả về 1 hoặc 2 dòng chữ cho toạ độ theo định dạng. */
+              fun lines(lat: Double, lon: Double, f: CoordFmt): List<String> {
+                  return when (f) {
+                      CoordFmt.DD -> listOf(dec(abs(lat), 5) + "° " + hemi(lat, true), dec(abs(lon), 5) + "° " + hemi(lon, false))
+                      CoordFmt.DDM -> listOf(ddm(lat, true), ddm(lon, false))
+                      CoordFmt.DMS -> listOf(dms(lat, true), dms(lon, false))
+                      CoordFmt.UTM -> {
+                          val u = toUtm(lat, lon)
+                          listOf("${u.zone}${u.band}", String.format(Locale.US, "%.0f E  %.0f N", u.easting, u.northing))
+                      }
+                      CoordFmt.MGRS -> listOf(mgrs(lat, lon))
+                  }
+              }
+
+              fun oneLine(lat: Double, lon: Double, f: CoordFmt): String = lines(lat, lon, f).joinToString(", ")
+
+              private fun ddm(v: Double, isLat: Boolean): String {
+                  val a = abs(v)
+                  val d = floor(a).toInt()
+                  val m = (a - d) * 60.0
+                  return "$d° " + dec(m, 3) + "′ " + hemi(v, isLat)
+              }
+
+              private fun dms(v: Double, isLat: Boolean): String {
+                  val a = abs(v)
+                  var d = floor(a).toInt()
+                  val mf = (a - d) * 60.0
+                  var m = floor(mf).toInt()
+                  var s = Math.round((mf - m) * 60.0).toInt()
+                  if (s == 60) { s = 0; m += 1 }
+                  if (m == 60) { m = 0; d += 1 }
+                  return "$d°$m′$s″ " + hemi(v, isLat)
+              }
+
+              fun mapsLink(lat: Double, lon: Double): String =
+                  "https://www.google.com/maps/search/?api=1&query=" + String.format(Locale.US, "%.6f,%.6f", lat, lon)
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/Explain.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import java.util.Locale
+          import kotlin.math.abs
+          import kotlin.math.roundToInt
+
+          /** Lời giải thích hiện ra khi chạm vào từng thông số. */
+          object Explain {
+              private fun f1(v: Float) = String.format(Locale.US, "%.1f", v).replace('.', ',')
+
+              fun heading(h: Float, trueMode: Boolean, magH: Float, decl: Float, hasLoc: Boolean): String {
+                  val sb = StringBuilder()
+                  sb.append("Con số ${h.roundToInt() % 360}° là góc đo từ hướng Bắc, quay theo chiều kim đồng hồ, tới hướng đầu máy đang chỉ.\n")
+                  sb.append("• 0° = Bắc, 90° = Đông, 180° = Nam, 270° = Tây.\n\n")
+                  sb.append("Vì sao ra số này: cảm biến từ trường đo từ trường Trái Đất, gia tốc kế cho biết máy đang nghiêng thế nào. Máy ghép hai thứ lại để tính hướng Bắc từ, hiện là ${magH.roundToInt() % 360}°.\n\n")
+                  if (trueMode) {
+                      sb.append("Bạn đang dùng Bắc thực: máy cộng thêm độ lệch từ ${f1(decl)}° tại vị trí GPS của bạn, nên ra ${h.roundToInt() % 360}°. Độ lệch này có vì cực Bắc từ của Trái Đất không trùng cực Bắc địa lý.")
+                  } else if (!hasLoc) {
+                      sb.append("Đang dùng Bắc từ. Bật GPS để có Bắc thực, khớp với bản đồ hơn.")
+                  } else {
+                      sb.append("Đang dùng Bắc từ. Muốn khớp với bản đồ hãy chọn Bắc thực trong Cài đặt (độ lệch tại chỗ bạn là ${f1(decl)}°).")
+                  }
+                  sb.append("\n\nSố nhảy hoặc lệch nhiều thường do kim loại, loa, nam châm hoặc ốp lưng từ tính ở gần máy.")
+                  return sb.toString()
+              }
+
+              fun north(trueMode: Boolean, decl: Float, hasLoc: Boolean): String {
+                  val sb = StringBuilder()
+                  sb.append("• Bắc từ: hướng mà kim la bàn chỉ, theo từ trường Trái Đất.\n")
+                  sb.append("• Bắc thực: hướng về cực Bắc địa lý, là hướng của các đường kinh tuyến trên bản đồ.\n\n")
+                  sb.append("Hai hướng này lệch nhau một góc gọi là độ lệch từ. Góc đó thay đổi theo nơi bạn đứng và theo năm; máy tính từ mô hình từ trường Trái Đất dựa trên vị trí GPS.\n\n")
+                  sb.append(if (trueMode) "Hiện bạn dùng Bắc thực, độ lệch tại đây là ${f1(decl)}°."
+                  else if (!hasLoc) "Hiện chưa có GPS nên chỉ dùng được Bắc từ."
+                  else "Hiện bạn dùng Bắc từ. Độ lệch tại đây là ${f1(decl)}°; chọn Bắc thực trong Cài đặt để bù.")
+                  return sb.toString()
+              }
+
+              fun gps(acc: Float?, provider: String?): String {
+                  if (acc == null) {
+                      return "Máy chưa xác định được vị trí.\n\nHãy bật Định vị trong cài đặt máy, cấp quyền vị trí cho app và ra nơi thoáng. Lần đầu có thể mất vài chục giây đến vài phút."
+                  }
+                  val src = if (provider == "gps") "vệ tinh GPS" else if (provider == "network") "Wi-Fi và trạm di động" else "nguồn định vị của máy"
+                  return "±${acc.roundToInt()} m nghĩa là vị trí thật của bạn nhiều khả năng nằm trong vòng tròn bán kính ${acc.roundToInt()} m quanh điểm máy báo (độ tin cậy khoảng 68%).\n\n" +
+                      "Hiện máy lấy vị trí từ $src.\n" +
+                      "• Ngoài trời thoáng, GPS thường sai vài mét.\n" +
+                      "• Định vị bằng Wi-Fi hoặc trạm thường sai vài chục đến hàng trăm mét.\n" +
+                      "• Trong nhà, giữa nhà cao tầng hoặc dưới tán cây dày thì sai số tăng lên."
+              }
+
+              fun coord(f: CoordFmt, lat: Double, lon: Double, acc: Float?): String {
+                  val sb = StringBuilder()
+                  val ns = if (lat >= 0) "phía Bắc" else "phía Nam"
+                  val ew = if (lon >= 0) "phía Đông" else "phía Tây"
+                  sb.append("Vĩ độ ${String.format(Locale.US, "%.5f", abs(lat))}° cho biết bạn cách đường xích đạo bấy nhiêu độ về $ns. ")
+                  sb.append("Kinh độ ${String.format(Locale.US, "%.5f", abs(lon))}° cho biết bạn cách kinh tuyến gốc Greenwich bấy nhiêu độ về $ew. Hai số này xác định một điểm duy nhất trên Trái Đất.\n\n")
+                  sb.append("Định dạng đang chọn: ${f.label}.\n")
+                  when (f) {
+                      CoordFmt.DD -> sb.append("Độ thập phân là cách ngắn gọn nhất, các app bản đồ như Google Maps dùng cách này. Chữ B/N là Bắc/Nam, Đ/T là Đông/Tây.")
+                      CoordFmt.DDM -> sb.append("Độ + phút thập phân: 1 độ chia 60 phút. Phần lẻ sau dấu phẩy của độ được đổi ra phút. Hay dùng trong hàng hải và hàng không.")
+                      CoordFmt.DMS -> sb.append("Độ phút giây là cách cổ điển: 1 độ = 60 phút (′), 1 phút = 60 giây (″). Một giây vĩ độ tương ứng khoảng 30 m trên mặt đất.")
+                      CoordFmt.UTM -> {
+                          val u = Coord.toUtm(lat, lon)
+                          sb.append("UTM chia Trái Đất thành 60 múi, mỗi múi rộng 6° kinh độ. Bạn đang ở múi ${u.zone}, dải vĩ độ ${u.band}. ")
+                          sb.append("Số E (easting) là số mét tính sang phải từ đường giữa múi, được cộng thêm 500.000 để luôn dương. ")
+                          sb.append("Số N (northing) là số mét tính từ xích đạo lên phía Bắc. Việt Nam nằm trong múi 48 (102°–108°Đ) và múi 49 (108°–114°Đ). Đơn vị là mét nên tiện đo khoảng cách trên bản đồ giấy.")
+                      }
+                      CoordFmt.MGRS -> {
+                          val u = Coord.toUtm(lat, lon)
+                          sb.append("MGRS dựa trên UTM: múi ${u.zone}, dải ${u.band}, rồi 2 chữ cái chọn ô lưới vuông 100 km, sau đó là 2 số 5 chữ số cho vị trí trong ô (tính bằng mét). Quân đội và cứu hộ hay dùng vì đọc qua bộ đàm gọn.")
+                      }
+                  }
+                  if (acc != null) sb.append("\n\nSai số hiện tại khoảng ±${acc.roundToInt()} m, nên đừng đọc quá chi tiết các chữ số cuối.")
+                  return sb.toString()
+              }
+
+              fun altitude(alt: Double?, isMsl: Boolean, hasLoc: Boolean): String {
+                  if (!hasLoc || alt == null) return "Độ cao lấy từ GPS nên cần có vị trí. Hãy bật định vị và ra nơi thoáng."
+                  val sb = StringBuilder()
+                  sb.append("Máy báo ${alt.roundToInt()} m.\n\n")
+                  if (isMsl) {
+                      sb.append("Đây là độ cao so với mực nước biển trung bình, máy đã quy đổi từ độ cao vệ tinh bằng mô hình trọng trường.\n\n")
+                  } else {
+                      sb.append("Đây là độ cao so với mặt elipsoid WGS84 mà GPS dùng, không hẳn là mực nước biển; hai giá trị có thể lệch nhau vài chục mét tuỳ nơi.\n\n")
+                  }
+                  sb.append("Độ cao GPS luôn kém chính xác hơn vị trí ngang, sai số theo chiều đứng thường lớn gấp vài lần. Muốn đo độ cao chính xác hơn cần cảm biến áp suất, và phải chuẩn lại khi thời tiết đổi.")
+                  return sb.toString()
+              }
+
+              fun magnetic(ut: Float): String {
+                  val verdict = if (ut in 25f..65f) "Mức này nằm trong khoảng bình thường, la bàn đáng tin."
+                  else "Mức này ngoài khoảng bình thường, có thể có nam châm, loa, kim loại, ốp lưng từ hoặc thiết bị điện gần máy, nên hướng có thể sai."
+                  return "Từ trường được đo bằng micro-tesla (µT). Máy đo được ${ut.roundToInt()} µT.\n\n" +
+                      "Từ trường Trái Đất ở mặt đất thường khoảng 25–65 µT; ở Việt Nam hay gặp quanh 40–50 µT.\n\n" +
+                      verdict + "\n\nLa bàn của máy dựa vào đúng con số này để tìm hướng Bắc, nên nó là chỉ báo nhanh xem có bị nhiễu không."
+              }
+
+              fun level(x: Float, y: Float): String {
+                  return "Gia tốc kế đo hướng của trọng lực. Khi máy nằm phẳng, trọng lực vuông góc màn hình nên cả hai góc bằng 0°.\n\n" +
+                      "• Số thứ nhất (${f1(abs(x))}°) là độ nghiêng trái–phải.\n" +
+                      "• Số thứ hai (${f1(abs(y))}°) là độ nghiêng trước–sau.\n\n" +
+                      "Bong bóng luôn lăn về phía cao hơn, giống thước thủy thật. Bong bóng chuyển xanh khi cả hai góc dưới 1,5°. Hãy đặt máy nằm phẳng sát bề mặt cần đo, tháo ốp lưng dày nếu có."
+              }
+
+              fun tilt(t: Float): String {
+                  return "Góc so với mặt phẳng nằm ngang. Máy tính bằng cách so hướng trọng lực với trục vuông góc màn hình: nằm phẳng là 0°, dựng đứng là 90°.\n\nHiện máy nghiêng ${t.roundToInt()}°."
+              }
+
+              fun sun(hasLoc: Boolean, rise: String?, set: String?): String {
+                  if (!hasLoc) return "Giờ mặt trời mọc và lặn phụ thuộc vào vĩ độ, kinh độ và ngày trong năm, nên cần có vị trí GPS."
+                  return "Giờ mọc ${rise ?: "—"}, giờ lặn ${set ?: "—"} (giờ địa phương).\n\n" +
+                      "Máy tính bằng công thức thiên văn từ vĩ độ, kinh độ và ngày trong năm. Mặt trời được coi là mọc hoặc lặn khi tâm của nó cách đường chân trời 90,83° (tính cả khúc xạ ánh sáng của khí quyển).\n\n" +
+                      "Gần đường xích đạo, giờ mọc lặn ít đổi theo mùa; xa hơn thì đổi nhiều. Thực tế có thể lệch vài phút do địa hình và độ cao."
+              }
+
+              fun moon(age: Double, name: String): String {
+                  return "Tuổi trăng ${String.format(Locale.US, "%.1f", age).replace('.', ',')} ngày: số ngày kể từ lần trăng non gần nhất. Pha hiện tại: $name.\n\n" +
+                      "Một chu kỳ trăng dài trung bình 29,53 ngày. Máy tính từ một mốc trăng non đã biết (ngày 6/1/2000) cộng thêm số chu kỳ trôi qua, nên có thể lệch vài giờ so với lịch thiên văn."
+              }
+
+              fun calibration(acc: Int): String {
+                  val st = when (acc) {
+                      3 -> "Cao"
+                      2 -> "Trung bình"
+                      1 -> "Thấp"
+                      else -> "Chưa tin cậy"
+                  }
+                  return "Hệ điều hành Android tự đánh giá độ tin cậy của cảm biến từ trường. Hiện là: $st.\n\n" +
+                      "Cảm biến bị lệch do từ trường của chính linh kiện trong máy và vật xung quanh. Khi vẫy máy theo hình số 8 theo nhiều hướng, máy thu được nhiều mẫu từ trường và tự tính lại phần lệch để bù.\n\n" +
+                      "Mẹo: làm ở nơi xa kim loại, nam châm, loa; tháo ốp lưng từ tính."
+              }
+
+              fun navigation(dist: Float?, bearing: Float?, trueH: Float): String {
+                  val extra = if (dist != null && bearing != null)
+                      "\n\nHiện còn ${Geo.fmtDist(dist)}, điểm đích nằm ở hướng ${bearing.roundToInt() % 360}° (${Geo.dirName(bearing)}), đầu máy đang chỉ ${trueH.roundToInt() % 360}°." else ""
+                  return "• Khoảng cách là đường chim bay trên mặt cầu Trái Đất, không phải quãng đường đi thực tế.\n" +
+                      "• Hướng là góc từ Bắc thực tới điểm đích.\n" +
+                      "• Mũi tên = hướng điểm đích trừ hướng đầu máy, nên khi mũi tên chỉ thẳng lên là bạn đang quay đúng về phía điểm đích." + extra
+              }
+
+              fun map(): String {
+                  return "Bản đồ lấy từ OpenStreetMap, tải từng ô nhỏ qua mạng và lưu lại trong máy, nên chỗ đã xem rồi vẫn hiện được khi mất mạng.\n\n" +
+                      "• Chấm xanh dương: vị trí của bạn; vòng mờ quanh nó là sai số GPS; hình quạt chỉ hướng đầu máy.\n" +
+                      "• Chấm cam: điểm đã lưu; chấm xanh lá: điểm đang dẫn đường, nối với bạn bằng đường nét đứt.\n" +
+                      "• Kéo để di chuyển, chụm hai ngón hoặc bấm + / − để phóng to thu nhỏ, giữ lâu một chỗ để thêm điểm.\n" +
+                      "• Thước ở góc dưới trái cho biết độ dài thật trên bản đồ."
+              }
+          }
           AMLICH_EOF
           mkdir -p "app/src/main/java/vn/compass/app"
           cat > "app/src/main/java/vn/compass/app/Geo.kt" <<'AMLICH_EOF'
@@ -151,7 +420,7 @@ jobs:
           object Geo {
               private val dirs = arrayOf("Bắc", "Đông Bắc", "Đông", "Đông Nam", "Nam", "Tây Nam", "Tây", "Tây Bắc")
 
-              fun dirName(h: Float): String = dirs[((h / 45f).roundToInt()) % 8]
+              fun dirName(h: Float): String = dirs[(((h / 45f).roundToInt() % 8) + 8) % 8]
 
               /** [0] = khoảng cách (m), [1] = hướng Bắc thực (độ 0..360) */
               fun distBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): FloatArray {
@@ -238,10 +507,16 @@ jobs:
           import android.Manifest
           import android.app.Activity
           import android.app.AlertDialog
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Intent
           import android.content.SharedPreferences
           import android.content.pm.PackageManager
           import android.content.res.ColorStateList
+          import android.graphics.Color
           import android.hardware.SensorManager
+          import android.net.Uri
+          import android.os.Build
           import android.os.Bundle
           import android.os.VibrationEffect
           import android.os.Vibrator
@@ -256,6 +531,7 @@ jobs:
           import android.widget.Switch
           import android.widget.TextView
           import android.widget.Toast
+          import java.io.File
           import kotlin.math.abs
           import kotlin.math.min
           import kotlin.math.roundToInt
@@ -265,18 +541,28 @@ jobs:
               private lateinit var prefs: SharedPreferences
               private lateinit var body: FrameLayout
               private val tabViews = ArrayList<TextView>()
-              private val tabNames = arrayOf("La bàn", "Điểm", "Công cụ", "Cài đặt")
+              private val tabNames = arrayOf("La bàn", "Bản đồ", "Điểm", "Công cụ", "Cài đặt")
               private var tab = 0
               private val ticks = ArrayList<() -> Unit>()
               private var lockAt: Float? = null
               private var wasNorth = false
               private var lastVib = 0L
 
+              private var mapPage: View? = null
+              private var mapView: MapView? = null
+              private var mapCentered = false
+              private var lastMapInv = 0L
+
+              @Suppress("DEPRECATION")
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("compass", MODE_PRIVATE)
+                  C.apply(prefs.getInt("theme", 0))
                   window.statusBarColor = C.BG
                   window.navigationBarColor = C.BG
-                  prefs = getSharedPreferences("compass", MODE_PRIVATE)
+                  window.decorView.systemUiVisibility = if (C.LIGHT) {
+                      View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR or View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR
+                  } else 0
                   hub = SensorHub(this)
 
                   val root = LinearLayout(this)
@@ -363,10 +649,26 @@ jobs:
 
               private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
+              private fun explain(title: String, msg: String) {
+                  AlertDialog.Builder(this).setTitle(title).setMessage(msg).setPositiveButton("Đã hiểu", null).show()
+              }
+
+              private fun View.tap(title: String, msg: () -> String) {
+                  isClickable = true
+                  setOnClickListener { explain(title, msg()) }
+              }
+
+              private fun fmt(): CoordFmt = CoordFmt.values()[prefs.getInt("fmt", 0).coerceIn(0, CoordFmt.values().size - 1)]
+
               private fun trueMode(): Boolean = prefs.getBoolean("true", true) && hub.location != null
               private fun dispHeading(): Float = if (trueMode()) (hub.heading + hub.declination + 360f) % 360f else hub.heading
               private fun trueHeading(): Float = (hub.heading + (if (hub.location != null) hub.declination else 0f) + 360f) % 360f
-              private fun dms() = prefs.getBoolean("dms", false)
+
+              private fun altInfo(): Pair<Double?, Boolean> {
+                  val l = hub.location ?: return Pair(null, false)
+                  if (Build.VERSION.SDK_INT >= 34 && l.hasMslAltitude()) return Pair(l.mslAltitudeMeters, true)
+                  return Pair(if (l.hasAltitude()) l.altitude else null, false)
+              }
 
               private fun applyKeepOn() {
                   if (prefs.getBoolean("keep", true)) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -394,6 +696,98 @@ jobs:
                   wasNorth = near
               }
 
+              private fun copyText(s: String) {
+                  val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                  cm.setPrimaryClip(ClipData.newPlainText("La Bàn", s))
+                  toast("Đã sao chép")
+              }
+
+              private fun shareText(s: String) {
+                  val i = Intent(Intent.ACTION_SEND)
+                  i.type = "text/plain"
+                  i.putExtra(Intent.EXTRA_TEXT, s)
+                  startActivity(Intent.createChooser(i, "Chia sẻ"))
+              }
+
+              private fun openInMaps(lat: Double, lon: Double, name: String) {
+                  try {
+                      val q = String.format(java.util.Locale.US, "%.6f,%.6f", lat, lon)
+                      startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("geo:$q?q=$q(" + Uri.encode(name) + ")")))
+                  } catch (e: Exception) {
+                      try {
+                          startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(Coord.mapsLink(lat, lon))))
+                      } catch (e2: Exception) {
+                          toast("Không mở được bản đồ")
+                      }
+                  }
+              }
+
+              private fun pointShareText(p: Pt): String =
+                  p.name + "\n" + Coord.oneLine(p.lat, p.lon, fmt()) + "\n" + Coord.mapsLink(p.lat, p.lon)
+
+              private fun askName(lat: Double, lon: Double) {
+                  val input = EditText(this)
+                  input.setText("Điểm ${Points.all(this).size + 1}")
+                  input.setSelectAllOnFocus(true)
+                  AlertDialog.Builder(this)
+                      .setTitle("Đánh dấu vị trí")
+                      .setMessage(Coord.oneLine(lat, lon, fmt()))
+                      .setView(input)
+                      .setPositiveButton("Lưu") { _, _ ->
+                          val n = input.text.toString().trim().ifEmpty { "Điểm mới" }
+                          Points.add(this, n, lat, lon)
+                          toast("Đã lưu \"$n\"")
+                          refreshAfterPoints()
+                      }
+                      .setNegativeButton("Hủy", null)
+                      .show()
+              }
+
+              private fun markHere() {
+                  val loc = hub.location
+                  if (loc == null) {
+                      toast("Chưa có vị trí GPS. Hãy ra nơi thoáng và bật định vị.")
+                      return
+                  }
+                  askName(loc.latitude, loc.longitude)
+              }
+
+              private fun refreshAfterPoints() {
+                  if (tab == 1 || tab == 2) show(tab)
+              }
+
+              private fun pointMenu(p: Pt) {
+                  val isTarget = prefs.getLong("target", -1L) == p.id
+                  val items = arrayOf(
+                      if (isTarget) "Bỏ dẫn đường" else "Dẫn đường tới đây",
+                      "Mở trong Google Maps",
+                      "Chia sẻ",
+                      "Xóa điểm"
+                  )
+                  AlertDialog.Builder(this)
+                      .setTitle(p.name)
+                      .setItems(items) { _, which ->
+                          when (which) {
+                              0 -> {
+                                  prefs.edit().putLong("target", if (isTarget) -1L else p.id).apply()
+                                  refreshAfterPoints()
+                              }
+                              1 -> openInMaps(p.lat, p.lon, p.name)
+                              2 -> shareText(pointShareText(p))
+                              3 -> AlertDialog.Builder(this)
+                                  .setTitle(p.name)
+                                  .setMessage("Xóa điểm này?")
+                                  .setPositiveButton("Xóa") { _, _ ->
+                                      Points.remove(this, p.id)
+                                      refreshAfterPoints()
+                                  }
+                                  .setNegativeButton("Hủy", null)
+                                  .show()
+                          }
+                      }
+                      .show()
+              }
+
               // ---------- thanh tab ----------
 
               private fun buildTabBar(): View {
@@ -401,7 +795,7 @@ jobs:
                   bar.orientation = LinearLayout.HORIZONTAL
                   bar.setBackgroundColor(C.BG)
                   for (i in tabNames.indices) {
-                      val t = tv(this, tabNames[i], 13f, C.MUTED, true)
+                      val t = tv(this, tabNames[i], 12f, C.MUTED, true)
                       t.gravity = Gravity.CENTER
                       t.isClickable = true
                       t.setOnClickListener { show(i) }
@@ -423,8 +817,9 @@ jobs:
                   body.removeAllViews()
                   val v = when (t) {
                       0 -> compassPage()
-                      1 -> pointsPage()
-                      2 -> toolsPage()
+                      1 -> mapPageView()
+                      2 -> pointsPage()
+                      3 -> toolsPage()
                       else -> settingsPage()
                   }
                   body.addView(v, FrameLayout.LayoutParams(-1, -1))
@@ -447,25 +842,19 @@ jobs:
                   return (b - (if (trueMode()) 0f else hub.declination) + 360f) % 360f
               }
 
-              private fun markHere() {
+              private fun coordDialog() {
                   val loc = hub.location
                   if (loc == null) {
-                      toast("Chưa có vị trí GPS. Hãy ra nơi thoáng và bật định vị.")
+                      explain("Tọa độ", "Chưa có vị trí GPS.\n\nHãy bật Định vị trong cài đặt máy, cấp quyền vị trí cho app và ra nơi thoáng.")
                       return
                   }
-                  val input = EditText(this)
-                  input.setText("Điểm ${Points.all(this).size + 1}")
-                  input.setSelectAllOnFocus(true)
+                  val text = Coord.oneLine(loc.latitude, loc.longitude, fmt()) + "\n" + Coord.mapsLink(loc.latitude, loc.longitude)
                   AlertDialog.Builder(this)
-                      .setTitle("Đánh dấu vị trí")
-                      .setView(input)
-                      .setPositiveButton("Lưu") { _, _ ->
-                          val n = input.text.toString().trim().ifEmpty { "Điểm mới" }
-                          Points.add(this, n, loc.latitude, loc.longitude)
-                          toast("Đã lưu \"$n\"")
-                          if (tab == 1) show(1)
-                      }
-                      .setNegativeButton("Hủy", null)
+                      .setTitle("Tọa độ của bạn")
+                      .setMessage(Coord.oneLine(loc.latitude, loc.longitude, fmt()) + "\n\n" + Explain.coord(fmt(), loc.latitude, loc.longitude, loc.accuracy))
+                      .setPositiveButton("Sao chép") { _, _ -> copyText(text) }
+                      .setNeutralButton("Chia sẻ") { _, _ -> shareText("Vị trí của tôi:\n$text") }
+                      .setNegativeButton("Đóng", null)
                       .show()
               }
 
@@ -474,31 +863,50 @@ jobs:
 
                   val top = row()
                   val left = column()
-                  left.addView(tv(this, "HƯỚNG BẮC", 12f, C.MUTED))
+                  left.addView(tv(this, "HƯỚNG BẮC ⓘ", 12f, C.MUTED))
                   val tvNorth = tv(this, "", 16f, C.TEXT, true)
                   left.addView(tvNorth)
+                  left.tap("Bắc thực và Bắc từ") { Explain.north(trueMode(), hub.declination, hub.location != null) }
                   top.addView(left, lp(0, -2, 1f))
                   val pill = tv(this, "", 13f, C.GREEN, true)
                   pill.setPadding(dp(12), dp(6), dp(12), dp(6))
+                  pill.tap("Độ chính xác GPS") { Explain.gps(hub.location?.accuracy, hub.location?.provider) }
                   top.addView(pill)
                   col.addView(top)
 
                   val cv = CompassView(this)
-                  val cvp = lp(-2, -2, t = 18)
+                  cv.tap("Số độ trên la bàn") { Explain.heading(dispHeading(), trueMode(), hub.heading, hub.declination, hub.location != null) }
+                  val cvp = lp(-2, -2, t = 16)
                   cvp.gravity = Gravity.CENTER_HORIZONTAL
                   col.addView(cv, cvp)
 
-                  val r1 = row()
+                  // thẻ tọa độ
+                  val cc = card()
+                  val chead = row()
+                  chead.addView(tv(this, "TỌA ĐỘ ⓘ", 12f, C.MUTED, true), lp(0, -2, 1f))
+                  val chip = tv(this, "", 12f, C.AMBER, true)
+                  chip.setPadding(dp(10), dp(5), dp(10), dp(5))
+                  chip.background = roundBg(this, C.CHIPBG, 14)
+                  chip.isClickable = true
+                  chip.setOnClickListener {
+                      prefs.edit().putInt("fmt", (prefs.getInt("fmt", 0) + 1) % CoordFmt.values().size).apply()
+                  }
+                  chead.addView(chip)
+                  cc.addView(chead)
+                  val l1 = tv(this, "—", 20f, C.TEXT, true)
+                  val l2 = tv(this, "", 20f, C.TEXT, true)
+                  cc.addView(l1, lp(-2, -2, t = 6))
+                  cc.addView(l2)
+                  cc.setOnClickListener { coordDialog() }
+                  col.addView(cc, lp(-1, -2, t = 14))
+
                   val r2 = row()
-                  val mLat = metric("Vĩ độ")
-                  val mLon = metric("Kinh độ")
-                  val mAlt = metric("Độ cao")
-                  val mMag = metric("Từ trường")
-                  r1.addView(mLat.first, lp(0, -2, 1f, r = 5))
-                  r1.addView(mLon.first, lp(0, -2, 1f, l = 5))
+                  val mAlt = metric("Độ cao ⓘ")
+                  val mMag = metric("Từ trường ⓘ")
+                  mAlt.first.tap("Độ cao") { val (a, msl) = altInfo(); Explain.altitude(a, msl, hub.location != null) }
+                  mMag.first.tap("Từ trường") { Explain.magnetic(hub.mag) }
                   r2.addView(mAlt.first, lp(0, -2, 1f, r = 5))
                   r2.addView(mMag.first, lp(0, -2, 1f, l = 5))
-                  col.addView(r1, lp(-1, -2, t = 16))
                   col.addView(r2, lp(-1, -2, t = 10))
 
                   val btns = row()
@@ -509,10 +917,12 @@ jobs:
                   val markBtn = button("Đánh dấu vị trí", true) { markHere() }
                   btns.addView(lockBtn, lp(0, dp(48), 1f, r = 5))
                   btns.addView(markBtn, lp(0, dp(48), 1f, l = 5))
-                  col.addView(btns, lp(-1, -2, t = 14))
+                  col.addView(btns, lp(-1, -2, t = 12))
+                  col.addView(tv(this, "Chạm vào từng thông số để xem giải thích.", 12f, C.MUTED), lp(-1, -2, t = 10))
 
                   ticks.add {
                       val h = dispHeading()
+                      cv.skin = prefs.getInt("skin", 0)
                       cv.heading = h
                       cv.centerText = "${h.roundToInt() % 360}°"
                       var sub = Geo.dirName(h)
@@ -527,29 +937,29 @@ jobs:
 
                       lockBtn.text = if (lockAt == null) "Khóa hướng" else "Mở khóa hướng"
                       tvNorth.text = if (trueMode()) "Bắc thực" else "Bắc từ"
+                      chip.text = fmt().label + " ▾"
                       val loc = hub.location
                       if (loc == null) {
-                          pill.text = "Chưa có GPS"
+                          pill.text = "Chưa có GPS ⓘ"
                           pill.setTextColor(C.AMBER)
-                          pill.background = roundBg(this, Color_amberDim, 20)
-                          mLat.second.text = "—"
-                          mLon.second.text = "—"
-                          mAlt.second.text = "—"
+                          pill.background = roundBg(this, C.ACCENTBG, 20)
+                          l1.text = "—"
+                          l2.text = ""
                       } else {
-                          pill.text = "GPS ±${loc.accuracy.roundToInt()} m"
+                          pill.text = "GPS ±${loc.accuracy.roundToInt()} m ⓘ"
                           pill.setTextColor(C.GREEN)
-                          pill.background = roundBg(this, Color_greenDim, 20)
-                          mLat.second.text = Geo.fmtCoord(loc.latitude, true, dms())
-                          mLon.second.text = Geo.fmtCoord(loc.longitude, false, dms())
-                          mAlt.second.text = if (loc.hasAltitude()) "${loc.altitude.roundToInt()} m" else "—"
+                          pill.background = roundBg(this, C.OKBG, 20)
+                          val ls = Coord.lines(loc.latitude, loc.longitude, fmt())
+                          l1.text = ls[0]
+                          l2.text = ls.getOrNull(1) ?: ""
                       }
+                      l2.visibility = if (l2.text.isEmpty()) View.GONE else View.VISIBLE
+                      val (alt, _) = altInfo()
+                      mAlt.second.text = if (alt != null) "${alt.roundToInt()} m" else "—"
                       mMag.second.text = "${hub.mag.roundToInt()} µT"
                   }
                   return page(col)
               }
-
-              private val Color_greenDim = android.graphics.Color.parseColor("#10281F")
-              private val Color_amberDim = android.graphics.Color.parseColor("#2A200A")
 
               private fun metric(label: String): Pair<LinearLayout, TextView> {
                   val c = card()
@@ -559,25 +969,99 @@ jobs:
                   return Pair(c, v)
               }
 
-              // ---------- 2. Điểm đánh dấu ----------
+              // ---------- 2. Bản đồ ----------
+
+              private fun circleBtn(text: String, onClick: () -> Unit): TextView {
+                  val t = tv(this, text, 22f, C.TEXT, true)
+                  t.gravity = Gravity.CENTER
+                  t.background = roundBg(this, C.SURFACE, 24, C.LINE2)
+                  t.isClickable = true
+                  t.setOnClickListener { onClick() }
+                  return t
+              }
+
+              private fun mapPageView(): View {
+                  val mv: MapView
+                  val existing = mapPage
+                  if (existing != null && mapView != null) {
+                      mv = mapView!!
+                      (existing.parent as? ViewGroup)?.removeView(existing)
+                  } else {
+                      mv = MapView(this)
+                      mapView = mv
+                      val fl = FrameLayout(this)
+                      fl.addView(mv, FrameLayout.LayoutParams(-1, -1))
+                      val ctrl = column()
+                      ctrl.addView(circleBtn("+") { mv.zoomBy(1f) }, lp(dp(48), dp(48), b = 8))
+                      ctrl.addView(circleBtn("−") { mv.zoomBy(-1f) }, lp(dp(48), dp(48), b = 8))
+                      ctrl.addView(circleBtn("◎") {
+                          val l = hub.location
+                          if (l != null) mv.centerOn(l.latitude, l.longitude) else toast("Chưa có vị trí GPS")
+                      }, lp(dp(48), dp(48)))
+                      val cp = FrameLayout.LayoutParams(-2, -2)
+                      cp.gravity = Gravity.END or Gravity.BOTTOM
+                      cp.setMargins(0, 0, dp(14), dp(34))
+                      fl.addView(ctrl, cp)
+                      val info = tv(this, "ⓘ Cách dùng", 12f, C.TEXT, true)
+                      info.setPadding(dp(12), dp(8), dp(12), dp(8))
+                      info.background = roundBg(this, C.SURFACE, 16, C.LINE2)
+                      info.tap("Bản đồ") { Explain.map() }
+                      val ip = FrameLayout.LayoutParams(-2, -2)
+                      ip.gravity = Gravity.START or Gravity.TOP
+                      ip.setMargins(dp(12), dp(14), 0, 0)
+                      fl.addView(info, ip)
+                      mv.onTapPoint = { p -> pointMenu(p) }
+                      mv.onLongPressAt = { la, lo -> askName(la, lo) }
+                      mapPage = fl
+                  }
+                  mv.points = Points.all(this)
+                  mv.targetId = prefs.getLong("target", -1L)
+                  ticks.add {
+                      val loc = hub.location
+                      mv.myLat = loc?.latitude
+                      mv.myLon = loc?.longitude
+                      mv.myAcc = loc?.accuracy ?: 0f
+                      mv.myHeading = trueHeading()
+                      if (!mapCentered && loc != null) {
+                          mapCentered = true
+                          mv.centerOn(loc.latitude, loc.longitude)
+                      }
+                      val now = System.currentTimeMillis()
+                      if (now - lastMapInv > 250L) {
+                          lastMapInv = now
+                          mv.invalidate()
+                      }
+                  }
+                  return mapPage!!
+              }
+
+              // ---------- 3. Điểm đánh dấu ----------
 
               private fun pointsPage(): View {
                   val col = column()
                   header(col, "Điểm đánh dấu", "Lưu nơi quan trọng và để la bàn chỉ đường về.")
 
                   val nav = row()
-                  nav.background = roundBg(this, android.graphics.Color.parseColor("#1C1708"), 18, C.AMBER)
+                  nav.background = roundBg(this, C.ACCENTBG, 18, C.AMBER)
                   nav.setPadding(dp(14), dp(14), dp(14), dp(14))
                   val arrow = ArrowView(this)
                   nav.addView(arrow, lp(dp(76), dp(76), r = 14))
                   val navCol = column()
-                  navCol.addView(tv(this, "ĐANG DẪN ĐƯỜNG", 12f, C.AMBER, true))
+                  navCol.addView(tv(this, "ĐANG DẪN ĐƯỜNG ⓘ", 12f, C.AMBER, true))
                   val navName = tv(this, "", 22f, C.TEXT, true)
                   navCol.addView(navName)
                   val navInfo = tv(this, "", 14f, C.SUB)
                   navCol.addView(navInfo)
                   nav.addView(navCol, lp(0, -2, 1f))
                   nav.visibility = View.GONE
+                  nav.tap("Khoảng cách và mũi tên") {
+                      val loc = hub.location
+                      val t = navPoint()
+                      if (loc != null && t != null) {
+                          val db = Geo.distBearing(loc.latitude, loc.longitude, t.lat, t.lon)
+                          Explain.navigation(db[0], db[1], trueHeading())
+                      } else Explain.navigation(null, null, trueHeading())
+                  }
                   col.addView(nav, lp(-1, -2, b = 12))
 
                   val listBox = column()
@@ -597,7 +1081,7 @@ jobs:
                       var pts = Points.all(this)
                       if (loc != null) pts = pts.sortedBy { Geo.distBearing(loc.latitude, loc.longitude, it.lat, it.lon)[0] }.toMutableList()
                       if (pts.isEmpty()) {
-                          listBox.addView(tv(this, "Chưa có điểm nào. Bấm \"Thêm điểm\" để lưu vị trí hiện tại.", 14f, C.MUTED), lp(-1, -2, t = 6))
+                          listBox.addView(tv(this, "Chưa có điểm nào. Bấm \"Thêm điểm\" để lưu vị trí hiện tại, hoặc giữ lâu trên bản đồ.", 14f, C.MUTED), lp(-1, -2, t = 6))
                       }
                       val target = prefs.getLong("target", -1L)
                       for (p in pts) {
@@ -606,11 +1090,11 @@ jobs:
                           r.setPadding(dp(12), dp(12), dp(14), dp(12))
                           val ini = tv(this, p.name.take(1).uppercase(), 16f, C.AMBER, true)
                           ini.gravity = Gravity.CENTER
-                          ini.background = roundBg(this, android.graphics.Color.parseColor("#1F2833"), 12)
+                          ini.background = roundBg(this, C.CHIPBG, 12)
                           r.addView(ini, lp(dp(40), dp(40), r = 12))
                           val mid = column()
                           mid.addView(tv(this, p.name, 16f, C.TEXT, true))
-                          mid.addView(tv(this, Geo.fmtCoord(p.lat, true, dms()) + ", " + Geo.fmtCoord(p.lon, false, dms()), 12f, C.MUTED))
+                          mid.addView(tv(this, Coord.oneLine(p.lat, p.lon, fmt()), 12f, C.MUTED))
                           r.addView(mid, lp(0, -2, 1f))
                           val right = column()
                           right.gravity = Gravity.END
@@ -625,22 +1109,14 @@ jobs:
                               fill()
                           }
                           r.setOnLongClickListener {
-                              AlertDialog.Builder(this)
-                                  .setTitle(p.name)
-                                  .setMessage("Xóa điểm này?")
-                                  .setPositiveButton("Xóa") { _, _ ->
-                                      Points.remove(this, p.id)
-                                      fill()
-                                  }
-                                  .setNegativeButton("Hủy", null)
-                                  .show()
+                              pointMenu(p)
                               true
                           }
                           listBox.addView(r, lp(-1, -2, b = 8))
                           refs.add(Ref(p, d, b))
                       }
                       if (pts.isNotEmpty()) {
-                          listBox.addView(tv(this, "Chạm để dẫn đường · giữ lâu để xóa", 12f, C.MUTED), lp(-1, -2, t = 2))
+                          listBox.addView(tv(this, "Chạm để dẫn đường · giữ lâu để xem thêm lựa chọn", 12f, C.MUTED), lp(-1, -2, t = 2))
                       }
                   }
                   fill()
@@ -677,11 +1153,24 @@ jobs:
                   return page(col)
               }
 
-              // ---------- 3. Công cụ ----------
+              // ---------- 4. Công cụ ----------
+
+              private class Triple3(val first: LinearLayout, val second: TextView, val third: TextView)
+
+              private fun toolCard(label: String): Triple3 {
+                  val c = card()
+                  c.setPadding(dp(14), dp(14), dp(14), dp(14))
+                  c.addView(tv(this, "$label ⓘ", 12f, C.MUTED, true))
+                  val v = tv(this, "—", 22f, C.TEXT, true)
+                  c.addView(v, lp(-2, -2, t = 6))
+                  val n = tv(this, "", 13f, C.SUB)
+                  c.addView(n, lp(-2, -2, t = 4))
+                  return Triple3(c, v, n)
+              }
 
               private fun toolsPage(): View {
                   val col = column()
-                  header(col, "Công cụ", "Các cảm biến hữu ích khi đi đường.")
+                  header(col, "Công cụ", "Chạm vào từng mục để xem giải thích.")
 
                   val lvCard = row()
                   lvCard.background = roundBg(this, C.SURFACE, 18, C.LINE)
@@ -689,18 +1178,25 @@ jobs:
                   val level = LevelView(this)
                   lvCard.addView(level, lp(dp(120), dp(120), r = 18))
                   val lvCol = column()
-                  lvCol.addView(tv(this, "THƯỚC THỦY", 12f, C.MUTED, true))
+                  lvCol.addView(tv(this, "THƯỚC THỦY ⓘ", 12f, C.MUTED, true))
                   val lvVal = tv(this, "", 28f, C.TEXT, true)
                   lvCol.addView(lvVal)
                   val lvNote = tv(this, "", 13f, C.GREEN, true)
                   lvCol.addView(lvNote)
                   lvCard.addView(lvCol, lp(0, -2, 1f))
+                  lvCard.tap("Thước thủy") { Explain.level(hub.tiltX, hub.tiltY) }
                   col.addView(lvCard)
 
+                  var sunRise: String? = null
+                  var sunSet: String? = null
                   val sun = toolCard("MẶT TRỜI")
                   val moon = toolCard("MẶT TRĂNG")
                   val mag = toolCard("TỪ TRƯỜNG")
                   val tilt = toolCard("ĐỘ NGHIÊNG")
+                  sun.first.tap("Mặt trời mọc và lặn") { Explain.sun(hub.location != null, sunRise, sunSet) }
+                  moon.first.tap("Mặt trăng") { val m = Geo.moon(); Explain.moon(m.first, m.second) }
+                  mag.first.tap("Từ trường") { Explain.magnetic(hub.mag) }
+                  tilt.first.tap("Độ nghiêng") { Explain.tilt(hub.tiltTotal) }
                   val g1 = row()
                   g1.addView(sun.first, lp(0, -2, 1f, r = 5))
                   g1.addView(moon.first, lp(0, -2, 1f, l = 5))
@@ -711,13 +1207,14 @@ jobs:
                   col.addView(g2, lp(-1, -2, t = 10))
 
                   val cal = row()
-                  cal.background = roundBg(this, android.graphics.Color.parseColor("#10201C"), 16, android.graphics.Color.parseColor("#1F4D3F"))
+                  cal.background = roundBg(this, C.OKBG, 16, C.LINE)
                   cal.setPadding(dp(16), dp(14), dp(16), dp(14))
                   val calCol = column()
-                  calCol.addView(tv(this, "Hiệu chuẩn la bàn", 15f, C.TEXT, true))
-                  val calNote = tv(this, "", 13f, android.graphics.Color.parseColor("#A7D8C8"))
+                  calCol.addView(tv(this, "Hiệu chuẩn la bàn ⓘ", 15f, C.TEXT, true))
+                  val calNote = tv(this, "", 13f, C.OKFG)
                   calCol.addView(calNote)
                   cal.addView(calCol, lp(0, -2, 1f))
+                  cal.tap("Hiệu chuẩn la bàn") { Explain.calibration(hub.accuracy) }
                   col.addView(cal, lp(-1, -2, t = 12))
 
                   ticks.add {
@@ -731,10 +1228,10 @@ jobs:
 
                       val loc = hub.location
                       if (loc != null) {
-                          val rise = Geo.sunTime(loc.latitude, loc.longitude, true)
-                          val set = Geo.sunTime(loc.latitude, loc.longitude, false)
-                          sun.second.text = rise ?: "—"
-                          sun.third.text = if (set != null) "Mọc · lặn lúc $set" else "Không mọc/lặn hôm nay"
+                          sunRise = Geo.sunTime(loc.latitude, loc.longitude, true)
+                          sunSet = Geo.sunTime(loc.latitude, loc.longitude, false)
+                          sun.second.text = sunRise ?: "—"
+                          sun.third.text = if (sunSet != null) "Mọc · lặn lúc $sunSet" else "Không mọc/lặn hôm nay"
                       } else {
                           sun.second.text = "—"
                           sun.third.text = "Cần vị trí GPS"
@@ -754,40 +1251,24 @@ jobs:
                           else -> Pair("Chưa tin cậy. Vẫy máy theo hình số 8 để hiệu chuẩn.", false)
                       }
                       calNote.text = txt
-                      calNote.setTextColor(if (ok) android.graphics.Color.parseColor("#A7D8C8") else C.AMBER)
+                      calNote.setTextColor(if (ok) C.OKFG else C.AMBER)
                   }
                   return page(col)
               }
 
-              private class Triple3(val first: LinearLayout, val second: TextView, val third: TextView)
+              // ---------- 5. Cài đặt ----------
 
-              private fun toolCard(label: String): Triple3 {
-                  val c = card()
-                  c.setPadding(dp(14), dp(14), dp(14), dp(14))
-                  c.addView(tv(this, label, 12f, C.MUTED, true))
-                  val v = tv(this, "—", 22f, C.TEXT, true)
-                  c.addView(v, lp(-2, -2, t = 6))
-                  val n = tv(this, "", 13f, C.SUB)
-                  c.addView(n, lp(-2, -2, t = 4))
-                  return Triple3(c, v, n)
-              }
-
-              // ---------- 4. Cài đặt ----------
-
-              private fun segmented(a: String, b: String, firstSelected: Boolean, onPick: (Boolean) -> Unit): LinearLayout {
+              private fun chipRow(options: List<String>, selected: Int, onPick: (Int) -> Unit): LinearLayout {
                   val r = row()
                   r.background = roundBg(this, C.BG, 12, C.LINE)
                   r.setPadding(dp(4), dp(4), dp(4), dp(4))
-                  for (i in 0..1) {
-                      val sel = (i == 0) == firstSelected
-                      val t = tv(this, if (i == 0) a else b, 14f, if (sel) C.DARKTEXT else C.SUB, true)
+                  for (i in options.indices) {
+                      val sel = i == selected
+                      val t = tv(this, options[i], 13f, if (sel) C.DARKTEXT else C.SUB, true)
                       t.gravity = Gravity.CENTER
                       if (sel) t.background = roundBg(this, C.AMBER, 9)
                       t.isClickable = true
-                      t.setOnClickListener {
-                          onPick(i == 0)
-                          show(tab)
-                      }
+                      t.setOnClickListener { onPick(i) }
                       r.addView(t, lp(0, dp(40), 1f))
                   }
                   return r
@@ -801,7 +1282,7 @@ jobs:
                   sw.isChecked = prefs.getBoolean(key, def)
                   val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
                   sw.trackTintList = ColorStateList(states, intArrayOf(C.AMBER, C.LINE2))
-                  sw.thumbTintList = ColorStateList(states, intArrayOf(android.graphics.Color.WHITE, C.TEXT))
+                  sw.thumbTintList = ColorStateList(states, intArrayOf(Color.WHITE, C.MUTED))
                   sw.setOnCheckedChangeListener { _, on ->
                       prefs.edit().putBoolean(key, on).apply()
                       onChange()
@@ -817,24 +1298,430 @@ jobs:
                   col.addView(tv(this, "ĐO HƯỚNG", 13f, C.MUTED, true), lp(-1, -2, t = 6, b = 8))
                   val c1 = card()
                   c1.addView(tv(this, "Hướng Bắc", 15f, C.TEXT, true))
-                  c1.addView(segmented("Bắc thực", "Bắc từ", prefs.getBoolean("true", true)) { prefs.edit().putBoolean("true", it).apply() }, lp(-1, -2, t = 10))
+                  c1.addView(
+                      chipRow(listOf("Bắc thực", "Bắc từ"), if (prefs.getBoolean("true", true)) 0 else 1) {
+                          prefs.edit().putBoolean("true", it == 0).apply()
+                          show(tab)
+                      }, lp(-1, -2, t = 10)
+                  )
                   c1.addView(tv(this, "Bắc thực đã bù độ lệch từ trường theo vị trí GPS (cần có GPS).", 13f, C.MUTED), lp(-1, -2, t = 8))
                   col.addView(c1)
 
                   val c2 = card()
-                  c2.addView(tv(this, "Kiểu hiển thị tọa độ", 15f, C.TEXT, true))
-                  c2.addView(segmented("21,0285°", "21°1′43″", !prefs.getBoolean("dms", false)) { prefs.edit().putBoolean("dms", !it).apply() }, lp(-1, -2, t = 10))
+                  c2.addView(tv(this, "Định dạng tọa độ", 15f, C.TEXT, true))
+                  val fmtBtn = button(fmt().label + "  ▾", false) {
+                      val labels = CoordFmt.values().map { it.label }.toTypedArray()
+                      AlertDialog.Builder(this)
+                          .setTitle("Định dạng tọa độ")
+                          .setSingleChoiceItems(labels, fmt().ordinal) { d, which ->
+                              prefs.edit().putInt("fmt", which).apply()
+                              d.dismiss()
+                              show(tab)
+                          }
+                          .show()
+                  }
+                  c2.addView(fmtBtn, lp(-1, dp(44), t = 10))
+                  c2.addView(tv(this, "Ví dụ: độ thập phân, độ phút giây, UTM, MGRS. Chạm vào tọa độ trên màn hình La bàn để xem giải thích.", 13f, C.MUTED), lp(-1, -2, t = 8))
                   col.addView(c2, lp(-1, -2, t = 10))
 
-                  col.addView(tv(this, "TRẢI NGHIỆM", 13f, C.MUTED, true), lp(-1, -2, t = 20, b = 8))
+                  col.addView(tv(this, "GIAO DIỆN", 13f, C.MUTED, true), lp(-1, -2, t = 20, b = 8))
                   val c3 = card()
-                  c3.setPadding(0, dp(4), 0, dp(4))
-                  toggleRow(c3, "Rung khi hướng về Bắc", "vib", true) {}
-                  toggleRow(c3, "Giữ màn hình luôn sáng", "keep", true) { applyKeepOn() }
+                  c3.addView(tv(this, "Màu sắc", 15f, C.TEXT, true))
+                  val cur = prefs.getInt("theme", 0)
+                  fun pickTheme(i: Int) {
+                      prefs.edit().putInt("theme", i).apply()
+                      recreate()
+                  }
+                  c3.addView(chipRow(C.themeNames.toList().subList(0, 3), if (cur < 3) cur else -1) { pickTheme(it) }, lp(-1, -2, t = 10))
+                  c3.addView(chipRow(C.themeNames.toList().subList(3, 5), if (cur >= 3) cur - 3 else -1) { pickTheme(it + 3) }, lp(-1, -2, t = 6))
+                  c3.addView(tv(this, "Kiểu mặt la bàn", 15f, C.TEXT, true), lp(-1, -2, t = 14))
+                  c3.addView(
+                      chipRow(listOf("Hiện đại", "Kim chỉ Bắc", "Tối giản"), prefs.getInt("skin", 0)) {
+                          prefs.edit().putInt("skin", it).apply()
+                          show(tab)
+                      }, lp(-1, -2, t = 10)
+                  )
                   col.addView(c3)
 
-                  col.addView(tv(this, "La Bàn 1.0 · Cảm biến: ${if (hub.hasSensor()) "có" else "không có"}", 12f, C.MUTED), lp(-1, -2, t = 20))
+                  col.addView(tv(this, "TRẢI NGHIỆM", 13f, C.MUTED, true), lp(-1, -2, t = 20, b = 8))
+                  val c4 = card()
+                  c4.setPadding(0, dp(4), 0, dp(4))
+                  toggleRow(c4, "Rung khi hướng về Bắc", "vib", true) {}
+                  toggleRow(c4, "Giữ màn hình luôn sáng", "keep", true) { applyKeepOn() }
+                  col.addView(c4)
+
+                  col.addView(tv(this, "BẢN ĐỒ", 13f, C.MUTED, true), lp(-1, -2, t = 20, b = 8))
+                  val c5 = card()
+                  c5.addView(tv(this, "Bản đồ lưu tạm trong máy để xem lại khi mất mạng.", 13f, C.MUTED))
+                  c5.addView(button("Xóa bản đồ đã lưu", false) {
+                      File(cacheDir, "tiles").deleteRecursively()
+                      mapView?.clearCache()
+                      toast("Đã xóa bản đồ đã lưu")
+                  }, lp(-1, dp(44), t = 10))
+                  c5.addView(tv(this, "Dữ liệu bản đồ © OpenStreetMap contributors.", 12f, C.MUTED), lp(-1, -2, t = 8))
+                  col.addView(c5)
+
+                  col.addView(tv(this, "La Bàn 1.1 · Cảm biến: ${if (hub.hasSensor()) "có" else "không có"}", 12f, C.MUTED), lp(-1, -2, t = 20))
                   return page(col)
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/MapView.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.DashPathEffect
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RectF
+          import android.os.Handler
+          import android.os.Looper
+          import android.util.LruCache
+          import android.view.MotionEvent
+          import android.view.ScaleGestureDetector
+          import android.view.View
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.Executors
+          import kotlin.math.PI
+          import kotlin.math.atan
+          import kotlin.math.cos
+          import kotlin.math.floor
+          import kotlin.math.ln
+          import kotlin.math.sin
+          import kotlin.math.sqrt
+
+          /** Bản đồ OpenStreetMap tự vẽ: kéo, chụm để phóng to, lưu đệm để xem lại khi không có mạng. */
+          class MapView(ctx: Context) : View(ctx) {
+              var centerLat = 21.0285
+              var centerLon = 105.8542
+              var zoom = 15f
+
+              var myLat: Double? = null
+              var myLon: Double? = null
+              var myAcc = 0f
+              var myHeading = 0f
+              var points: List<Pt> = emptyList()
+              var targetId = -1L
+              var onTapPoint: ((Pt) -> Unit)? = null
+              var onLongPressAt: ((Double, Double) -> Unit)? = null
+
+              private val dens = ctx.resources.displayMetrics.density
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val pool = Executors.newFixedThreadPool(3)
+              private val tileDir = File(ctx.cacheDir, "tiles")
+              private val loading = HashSet<String>()
+              private val failed = HashMap<String, Long>()
+              private val cache = object : LruCache<String, Bitmap>((Runtime.getRuntime().maxMemory() / 1024 / 8).toInt()) {
+                  override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
+              }
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val txt = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private var downX = 0f
+              private var downY = 0f
+              private var lastX = 0f
+              private var lastY = 0f
+              private var moved = false
+              private var longFired = false
+              private val longRun = Runnable {
+                  if (!moved) {
+                      longFired = true
+                      onLongPressAt?.invoke(yToLat(latToY(centerLat) + (downY - height / 2.0)), xToLon(lonToX(centerLon) + (downX - width / 2.0)))
+                  }
+              }
+
+              private val scaleDet = ScaleGestureDetector(ctx, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                  override fun onScale(detector: ScaleGestureDetector): Boolean {
+                      zoom = (zoom + (ln(detector.scaleFactor.toDouble()) / ln(2.0)).toFloat()).coerceIn(3f, 19f)
+                      invalidate()
+                      return true
+                  }
+              })
+
+              private fun world(): Double = 256.0 * dens * Math.pow(2.0, zoom.toDouble())
+              private fun lonToX(lon: Double) = (lon + 180.0) / 360.0 * world()
+              private fun latToY(lat: Double): Double {
+                  val s = sin(Math.toRadians(lat)).coerceIn(-0.9999, 0.9999)
+                  return (0.5 - ln((1.0 + s) / (1.0 - s)) / (4.0 * PI)) * world()
+              }
+
+              private fun xToLon(x: Double) = x / world() * 360.0 - 180.0
+              private fun yToLat(y: Double): Double {
+                  val n = PI - 2.0 * PI * y / world()
+                  return Math.toDegrees(atan(Math.sinh(n)))
+              }
+
+              fun zoomBy(d: Float) {
+                  zoom = (zoom + d).coerceIn(3f, 19f)
+                  invalidate()
+              }
+
+              fun centerOn(lat: Double, lon: Double) {
+                  centerLat = lat
+                  centerLon = lon
+                  invalidate()
+              }
+
+              fun clearCache() {
+                  cache.evictAll()
+                  failed.clear()
+                  tileDir.deleteRecursively()
+                  invalidate()
+              }
+
+              // ---------- tải ô bản đồ ----------
+
+              private fun getTile(z: Int, x: Int, y: Int): Bitmap? {
+                  val key = "$z/$x/$y"
+                  cache.get(key)?.let { return it }
+                  val f = failed[key]
+                  if (f != null && System.currentTimeMillis() - f < 15000L) return null
+                  if (loading.add(key)) {
+                      pool.execute {
+                          val b = loadTile(z, x, y)
+                          mainHandler.post {
+                              loading.remove(key)
+                              if (b != null) {
+                                  cache.put(key, b)
+                                  failed.remove(key)
+                              } else {
+                                  failed[key] = System.currentTimeMillis()
+                              }
+                              invalidate()
+                          }
+                      }
+                  }
+                  return null
+              }
+
+              private fun loadTile(z: Int, x: Int, y: Int): Bitmap? {
+                  val file = File(tileDir, "$z/$x/$y.png")
+                  val fresh = file.exists() && System.currentTimeMillis() - file.lastModified() < 7L * 86400000L
+                  if (fresh) {
+                      BitmapFactory.decodeFile(file.absolutePath)?.let { return it }
+                  }
+                  try {
+                      val c = URL("https://tile.openstreetmap.org/$z/$x/$y.png").openConnection() as HttpURLConnection
+                      c.setRequestProperty("User-Agent", "LaBan/1.0 (Android compass app)")
+                      c.connectTimeout = 8000
+                      c.readTimeout = 8000
+                      if (c.responseCode == 200) {
+                          val bytes = c.inputStream.use { it.readBytes() }
+                          file.parentFile?.mkdirs()
+                          file.writeBytes(bytes)
+                          return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                      }
+                  } catch (e: Exception) {
+                  }
+                  if (file.exists()) return BitmapFactory.decodeFile(file.absolutePath)
+                  return null
+              }
+
+              // ---------- vẽ ----------
+
+              private fun metersPerPx(lat: Double): Double = 40075016.686 * cos(Math.toRadians(lat)) / world()
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val d = dens
+                  c.drawColor(Color.parseColor("#E5E3DF"))
+                  val z = floor(zoom.toDouble()).toInt().coerceIn(2, 19)
+                  val tilePx = (256.0 * dens * Math.pow(2.0, (zoom - z).toDouble())).toFloat()
+                  val cxw = lonToX(centerLon)
+                  val cyw = latToY(centerLat)
+                  val left = cxw - w / 2.0
+                  val top = cyw - h / 2.0
+                  val n = 1 shl z
+                  val tx0 = floor(left / tilePx).toInt()
+                  val tx1 = floor((left + w) / tilePx).toInt()
+                  val ty0 = floor(top / tilePx).toInt()
+                  val ty1 = floor((top + h) / tilePx).toInt()
+                  val dst = RectF()
+                  for (ty in ty0..ty1) {
+                      if (ty < 0 || ty >= n) continue
+                      for (tx in tx0..tx1) {
+                          val wx = ((tx % n) + n) % n
+                          val bmp = getTile(z, wx, ty)
+                          if (bmp != null) {
+                              val x = (tx * tilePx - left).toFloat()
+                              val y = (ty * tilePx - top).toFloat()
+                              dst.set(x, y, x + tilePx + 0.5f, y + tilePx + 0.5f)
+                              c.drawBitmap(bmp, null, dst, paint)
+                          }
+                      }
+                  }
+
+                  fun sx(lon: Double) = (w / 2.0 + (lonToX(lon) - cxw)).toFloat()
+                  fun sy(lat: Double) = (h / 2.0 + (latToY(lat) - cyw)).toFloat()
+
+                  // đường tới điểm dẫn đường
+                  val ml = myLat
+                  val mo = myLon
+                  val target = points.firstOrNull { it.id == targetId }
+                  if (ml != null && mo != null && target != null) {
+                      paint.style = Paint.Style.STROKE
+                      paint.strokeWidth = 3 * d
+                      paint.color = Color.parseColor("#059669")
+                      paint.pathEffect = DashPathEffect(floatArrayOf(14 * d, 10 * d), 0f)
+                      val path = Path()
+                      path.moveTo(sx(mo), sy(ml))
+                      path.lineTo(sx(target.lon), sy(target.lat))
+                      c.drawPath(path, paint)
+                      paint.pathEffect = null
+                  }
+
+                  // điểm đã lưu
+                  txt.textSize = 12 * d
+                  txt.isFakeBoldText = true
+                  for (p in points) {
+                      val x = sx(p.lon)
+                      val y = sy(p.lat)
+                      if (x < -50 || y < -50 || x > w + 50 || y > h + 50) continue
+                      paint.style = Paint.Style.FILL
+                      paint.color = if (p.id == targetId) Color.parseColor("#059669") else Color.parseColor("#F59E0B")
+                      c.drawCircle(x, y, 8 * d, paint)
+                      paint.style = Paint.Style.STROKE
+                      paint.strokeWidth = 2 * d
+                      paint.color = Color.WHITE
+                      c.drawCircle(x, y, 8 * d, paint)
+                      txt.style = Paint.Style.STROKE
+                      txt.strokeWidth = 3 * d
+                      txt.color = Color.WHITE
+                      c.drawText(p.name, x + 12 * d, y + 4 * d, txt)
+                      txt.style = Paint.Style.FILL
+                      txt.color = Color.parseColor("#1F2937")
+                      c.drawText(p.name, x + 12 * d, y + 4 * d, txt)
+                  }
+
+                  // vị trí của tôi
+                  if (ml != null && mo != null) {
+                      val x = sx(mo)
+                      val y = sy(ml)
+                      val accPx = (myAcc / metersPerPx(ml)).toFloat()
+                      paint.style = Paint.Style.FILL
+                      paint.color = Color.argb(40, 37, 99, 235)
+                      c.drawCircle(x, y, accPx.coerceAtLeast(10 * d), paint)
+                      c.save()
+                      c.rotate(myHeading, x, y)
+                      paint.color = Color.argb(150, 37, 99, 235)
+                      val cone = Path()
+                      cone.moveTo(x, y - 30 * d)
+                      cone.lineTo(x - 11 * d, y - 6 * d)
+                      cone.lineTo(x + 11 * d, y - 6 * d)
+                      cone.close()
+                      c.drawPath(cone, paint)
+                      c.restore()
+                      paint.color = Color.parseColor("#2563EB")
+                      c.drawCircle(x, y, 8 * d, paint)
+                      paint.style = Paint.Style.STROKE
+                      paint.strokeWidth = 2.5f * d
+                      paint.color = Color.WHITE
+                      c.drawCircle(x, y, 8 * d, paint)
+                  }
+
+                  // thước tỉ lệ + ghi nguồn
+                  val mpp = metersPerPx(centerLat)
+                  val nice = doubleArrayOf(1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0, 50000.0, 100000.0, 200000.0, 500000.0, 1000000.0)
+                  var len = nice[0]
+                  for (v in nice) if (v / mpp <= 120 * d) len = v
+                  val barPx = (len / mpp).toFloat()
+                  val label = if (len >= 1000) "${(len / 1000).toInt()} km" else "${len.toInt()} m"
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeWidth = 3 * d
+                  paint.color = Color.parseColor("#1F2937")
+                  c.drawLine(16 * d, h - 16 * d, 16 * d + barPx, h - 16 * d, paint)
+                  txt.textSize = 11 * d
+                  txt.style = Paint.Style.STROKE
+                  txt.strokeWidth = 3 * d
+                  txt.color = Color.WHITE
+                  c.drawText(label, 16 * d, h - 22 * d, txt)
+                  txt.style = Paint.Style.FILL
+                  txt.color = Color.parseColor("#1F2937")
+                  c.drawText(label, 16 * d, h - 22 * d, txt)
+
+                  val attr = "© OpenStreetMap"
+                  txt.textAlign = Paint.Align.RIGHT
+                  txt.style = Paint.Style.STROKE
+                  txt.strokeWidth = 3 * d
+                  txt.color = Color.WHITE
+                  c.drawText(attr, w - 8 * d, h - 8 * d, txt)
+                  txt.style = Paint.Style.FILL
+                  txt.color = Color.parseColor("#374151")
+                  c.drawText(attr, w - 8 * d, h - 8 * d, txt)
+                  txt.textAlign = Paint.Align.LEFT
+              }
+
+              // ---------- chạm ----------
+
+              private fun pan(dx: Float, dy: Float) {
+                  val nx = lonToX(centerLon) - dx
+                  val ny = latToY(centerLat) - dy
+                  centerLon = xToLon(nx)
+                  centerLat = yToLat(ny).coerceIn(-84.0, 84.0)
+                  invalidate()
+              }
+
+              private fun tap(x: Float, y: Float) {
+                  val cxw = lonToX(centerLon)
+                  val cyw = latToY(centerLat)
+                  var best: Pt? = null
+                  var bd = 28f * dens
+                  for (p in points) {
+                      val px = (width / 2.0 + (lonToX(p.lon) - cxw)).toFloat()
+                      val py = (height / 2.0 + (latToY(p.lat) - cyw)).toFloat()
+                      val dd = sqrt(((px - x) * (px - x) + (py - y) * (py - y)).toDouble()).toFloat()
+                      if (dd < bd) {
+                          bd = dd
+                          best = p
+                      }
+                  }
+                  best?.let { onTapPoint?.invoke(it) }
+              }
+
+              override fun onTouchEvent(e: MotionEvent): Boolean {
+                  scaleDet.onTouchEvent(e)
+                  if (e.pointerCount > 1 || scaleDet.isInProgress) {
+                      moved = true
+                      removeCallbacks(longRun)
+                      lastX = e.x
+                      lastY = e.y
+                      return true
+                  }
+                  when (e.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          parent?.requestDisallowInterceptTouchEvent(true)
+                          downX = e.x
+                          downY = e.y
+                          lastX = e.x
+                          lastY = e.y
+                          moved = false
+                          longFired = false
+                          postDelayed(longRun, 600L)
+                      }
+                      MotionEvent.ACTION_MOVE -> {
+                          if (!moved && Math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) > 8 * dens) {
+                              moved = true
+                              removeCallbacks(longRun)
+                          }
+                          if (moved) pan(e.x - lastX, e.y - lastY)
+                          lastX = e.x
+                          lastY = e.y
+                      }
+                      MotionEvent.ACTION_UP -> {
+                          removeCallbacks(longRun)
+                          if (!moved && !longFired) tap(e.x, e.y)
+                      }
+                      MotionEvent.ACTION_CANCEL -> removeCallbacks(longRun)
+                  }
+                  return true
               }
           }
           AMLICH_EOF
@@ -1013,18 +1900,67 @@ jobs:
           import kotlin.math.min
 
           object C {
-              val BG = Color.parseColor("#0B0F14")
-              val SURFACE = Color.parseColor("#151B23")
-              val LINE = Color.parseColor("#27303B")
-              val LINE2 = Color.parseColor("#3B4757")
-              val TEXT = Color.parseColor("#F1F5F9")
-              val SUB = Color.parseColor("#CBD5E1")
-              val MUTED = Color.parseColor("#94A3B8")
-              val AMBER = Color.parseColor("#FBBF24")
-              val DARKTEXT = Color.parseColor("#1A1203")
-              val RED = Color.parseColor("#F87171")
-              val GREEN = Color.parseColor("#34D399")
-              val DIAL = Color.parseColor("#121821")
+              var BG = 0
+              var SURFACE = 0
+              var LINE = 0
+              var LINE2 = 0
+              var TEXT = 0
+              var SUB = 0
+              var MUTED = 0
+              var AMBER = 0      // màu nhấn
+              var DARKTEXT = 0   // chữ trên nền nhấn
+              var RED = 0
+              var GREEN = 0
+              var DIAL = 0
+              var ACCENTBG = 0
+              var CHIPBG = 0
+              var OKBG = 0
+              var OKFG = 0
+              var LIGHT = false
+
+              val themeNames = arrayOf("Tối", "Đen AMOLED", "Sáng", "Rừng xanh", "Hoàng hôn")
+              val themeSwatch = intArrayOf(
+                  Color.parseColor("#FBBF24"), Color.parseColor("#FBBF24"), Color.parseColor("#D97706"),
+                  Color.parseColor("#A3E635"), Color.parseColor("#FB923C")
+              )
+
+              private fun p(s: String) = Color.parseColor(s)
+
+              fun apply(id: Int) {
+                  LIGHT = id == 2
+                  when (id) {
+                      1 -> {
+                          BG = p("#000000"); SURFACE = p("#0B0B0B"); LINE = p("#1F1F1F"); LINE2 = p("#363636")
+                          TEXT = p("#F5F5F5"); SUB = p("#D4D4D4"); MUTED = p("#9CA3AF")
+                          AMBER = p("#FBBF24"); DARKTEXT = p("#1A1203"); RED = p("#F87171"); GREEN = p("#34D399")
+                          DIAL = p("#0B0B0B"); ACCENTBG = p("#1C1708"); CHIPBG = p("#1A1A1A"); OKBG = p("#0F1F19"); OKFG = p("#A7D8C8")
+                      }
+                      2 -> {
+                          BG = p("#F4F6F8"); SURFACE = p("#FFFFFF"); LINE = p("#E2E8F0"); LINE2 = p("#CBD5E1")
+                          TEXT = p("#0F172A"); SUB = p("#334155"); MUTED = p("#64748B")
+                          AMBER = p("#D97706"); DARKTEXT = p("#FFFFFF"); RED = p("#DC2626"); GREEN = p("#059669")
+                          DIAL = p("#FFFFFF"); ACCENTBG = p("#FEF3C7"); CHIPBG = p("#EEF2F6"); OKBG = p("#E3F5EC"); OKFG = p("#065F46")
+                      }
+                      3 -> {
+                          BG = p("#07130E"); SURFACE = p("#0E1F17"); LINE = p("#1D3A2B"); LINE2 = p("#2F5A43")
+                          TEXT = p("#ECFDF5"); SUB = p("#C7E8D5"); MUTED = p("#86B39B")
+                          AMBER = p("#A3E635"); DARKTEXT = p("#0B1A05"); RED = p("#FB7185"); GREEN = p("#34D399")
+                          DIAL = p("#0A1A12"); ACCENTBG = p("#13240A"); CHIPBG = p("#14291E"); OKBG = p("#12301F"); OKFG = p("#A7E8C4")
+                      }
+                      4 -> {
+                          BG = p("#140A1F"); SURFACE = p("#1E1230"); LINE = p("#34224D"); LINE2 = p("#4C3470")
+                          TEXT = p("#FDF4FF"); SUB = p("#E9D5FF"); MUTED = p("#B79CD6")
+                          AMBER = p("#FB923C"); DARKTEXT = p("#1F0D02"); RED = p("#F472B6"); GREEN = p("#4ADE80")
+                          DIAL = p("#190E29"); ACCENTBG = p("#2A1708"); CHIPBG = p("#2A1A40"); OKBG = p("#122A1E"); OKFG = p("#A7E8C4")
+                      }
+                      else -> {
+                          BG = p("#0B0F14"); SURFACE = p("#151B23"); LINE = p("#27303B"); LINE2 = p("#3B4757")
+                          TEXT = p("#F1F5F9"); SUB = p("#CBD5E1"); MUTED = p("#94A3B8")
+                          AMBER = p("#FBBF24"); DARKTEXT = p("#1A1203"); RED = p("#F87171"); GREEN = p("#34D399")
+                          DIAL = p("#121821"); ACCENTBG = p("#1C1708"); CHIPBG = p("#1F2833"); OKBG = p("#10201C"); OKFG = p("#A7D8C8")
+                      }
+                  }
+              }
           }
 
           fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
@@ -1052,6 +1988,7 @@ jobs:
               var navAt: Float? = null
               var centerText = "0°"
               var subText = ""
+              var skin = 0   // 0 hiện đại, 1 kim chỉ Bắc, 2 tối giản
 
               private val p = Paint(Paint.ANTI_ALIAS_FLAG)
               private val names = mapOf(0 to "N", 90 to "E", 180 to "S", 270 to "W")
@@ -1082,9 +2019,9 @@ jobs:
                   // vạch chia
                   p.style = Paint.Style.STROKE
                   p.strokeCap = Paint.Cap.ROUND
-                  for (a in 0 until 360 step 5) {
+                  for (a in 0 until 360 step (if (skin == 2) 10 else 5)) {
                       val major = a % 30 == 0
-                      p.color = if (a == 0) C.RED else if (major) C.TEXT else Color.parseColor("#64748B")
+                      p.color = if (a == 0) C.RED else if (major) C.TEXT else C.LINE2
                       p.strokeWidth = if (major) 2.2f * d else 1.6f * d
                       val len = if (major) 16 * d else 9 * d
                       c.save()
@@ -1097,6 +2034,7 @@ jobs:
                   p.textAlign = Paint.Align.CENTER
                   for (a in 0 until 360 step 30) {
                       val card = names.containsKey(a)
+                      if (skin == 2 && !card) continue
                       p.typeface = Typeface.DEFAULT_BOLD
                       p.textSize = (if (card) 20 else 12) * d
                       p.color = if (a == 0) C.RED else if (card) C.TEXT else C.MUTED
@@ -1120,6 +2058,24 @@ jobs:
                       c.drawCircle(cx, cy - r + 4 * d, 4.5f * d, p)
                       c.restore()
                   }
+                  if (skin == 1) {
+                      val nl = r * 0.5f
+                      val up = Path()
+                      up.moveTo(cx, cy - nl)
+                      up.lineTo(cx - 9 * d, cy)
+                      up.lineTo(cx + 9 * d, cy)
+                      up.close()
+                      p.style = Paint.Style.FILL
+                      p.color = C.RED
+                      c.drawPath(up, p)
+                      val dn = Path()
+                      dn.moveTo(cx, cy + nl)
+                      dn.lineTo(cx - 9 * d, cy)
+                      dn.lineTo(cx + 9 * d, cy)
+                      dn.close()
+                      p.color = C.MUTED
+                      c.drawPath(dn, p)
+                  }
                   c.restore()
 
                   // mũi tên cố định
@@ -1133,13 +2089,28 @@ jobs:
                   c.drawPath(tri, p)
 
                   // số độ ở giữa
-                  p.color = C.TEXT
+                  p.textAlign = Paint.Align.CENTER
                   p.typeface = Typeface.DEFAULT_BOLD
-                  p.textSize = 58 * d
-                  c.drawText(centerText, cx, cy + 12 * d, p)
-                  p.color = C.AMBER
-                  p.textSize = 16 * d
-                  c.drawText(subText, cx, cy + 40 * d, p)
+                  if (skin == 1) {
+                      p.style = Paint.Style.FILL
+                      p.color = C.DIAL
+                      p.alpha = 225
+                      c.drawRoundRect(cx - 62 * d, cy - 28 * d, cx + 62 * d, cy + 30 * d, 14 * d, 14 * d, p)
+                      p.alpha = 255
+                      p.color = C.TEXT
+                      p.textSize = 26 * d
+                      c.drawText(centerText, cx, cy + 4 * d, p)
+                      p.color = C.AMBER
+                      p.textSize = 12 * d
+                      c.drawText(subText, cx, cy + 22 * d, p)
+                  } else {
+                      p.color = C.TEXT
+                      p.textSize = (if (skin == 2) 68 else 58) * d
+                      c.drawText(centerText, cx, cy + 12 * d, p)
+                      p.color = C.AMBER
+                      p.textSize = 16 * d
+                      c.drawText(subText, cx, cy + 40 * d, p)
+                  }
               }
           }
 
