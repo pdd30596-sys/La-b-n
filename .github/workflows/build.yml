@@ -1,0 +1,1343 @@
+name: Build APK La Ban
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tao ma nguon du an
+        run: |
+          mkdir -p "$HOME/proj" && cd "$HOME/proj"
+          mkdir -p "app"
+          cat > "app/build.gradle" <<'AMLICH_EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'vn.compass.app'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId "vn.compass.app"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              signingConfigs {
+                  debug {
+                      storeFile rootProject.file('debug.keystore')
+                      storePassword 'android'
+                      keyAlias 'androiddebugkey'
+                      keyPassword 'android'
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main"
+          cat > "app/src/main/AndroidManifest.xml" <<'AMLICH_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <uses-feature
+                  android:name="android.hardware.sensor.compass"
+                  android:required="false" />
+              <uses-feature
+                  android:name="android.hardware.location"
+                  android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/Geo.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import android.location.Location
+          import java.util.Calendar
+          import java.util.Locale
+          import java.util.TimeZone
+          import kotlin.math.abs
+          import kotlin.math.atan
+          import kotlin.math.acos
+          import kotlin.math.asin
+          import kotlin.math.cos
+          import kotlin.math.floor
+          import kotlin.math.roundToInt
+          import kotlin.math.sin
+          import kotlin.math.tan
+
+          class Pt(val id: Long, val name: String, val lat: Double, val lon: Double)
+
+          object Points {
+              private fun prefs(ctx: Context): SharedPreferences = ctx.getSharedPreferences("compass", Context.MODE_PRIVATE)
+
+              fun all(ctx: Context): MutableList<Pt> {
+                  val out = ArrayList<Pt>()
+                  for (line in (prefs(ctx).getString("points", "") ?: "").split("\n")) {
+                      val p = line.split("\t")
+                      if (p.size == 4) {
+                          val id = p[0].toLongOrNull() ?: continue
+                          val la = p[2].toDoubleOrNull() ?: continue
+                          val lo = p[3].toDoubleOrNull() ?: continue
+                          out.add(Pt(id, p[1], la, lo))
+                      }
+                  }
+                  return out
+              }
+
+              private fun save(ctx: Context, l: List<Pt>) {
+                  val s = l.joinToString("\n") { "${it.id}\t${it.name.replace("\t", " ").replace("\n", " ")}\t${it.lat}\t${it.lon}" }
+                  prefs(ctx).edit().putString("points", s).apply()
+              }
+
+              fun add(ctx: Context, name: String, lat: Double, lon: Double) {
+                  val l = all(ctx)
+                  l.add(Pt(System.currentTimeMillis(), name, lat, lon))
+                  save(ctx, l)
+              }
+
+              fun remove(ctx: Context, id: Long) {
+                  save(ctx, all(ctx).filter { it.id != id })
+                  if (prefs(ctx).getLong("target", -1L) == id) prefs(ctx).edit().putLong("target", -1L).apply()
+              }
+          }
+
+          object Geo {
+              private val dirs = arrayOf("Bắc", "Đông Bắc", "Đông", "Đông Nam", "Nam", "Tây Nam", "Tây", "Tây Bắc")
+
+              fun dirName(h: Float): String = dirs[((h / 45f).roundToInt()) % 8]
+
+              /** [0] = khoảng cách (m), [1] = hướng Bắc thực (độ 0..360) */
+              fun distBearing(lat1: Double, lon1: Double, lat2: Double, lon2: Double): FloatArray {
+                  val r = FloatArray(2)
+                  Location.distanceBetween(lat1, lon1, lat2, lon2, r)
+                  r[1] = (r[1] + 360f) % 360f
+                  return r
+              }
+
+              fun fmtDist(m: Float): String {
+                  if (m < 1000f) return "${m.roundToInt()} m"
+                  val km = m / 1000f
+                  val s = if (km < 100f) String.format(Locale.US, "%.1f", km) else String.format(Locale.US, "%.0f", km)
+                  return s.replace('.', ',') + " km"
+              }
+
+              fun fmtCoord(v: Double, isLat: Boolean, dms: Boolean): String {
+                  val hemi = if (isLat) (if (v >= 0) "B" else "N") else (if (v >= 0) "Đ" else "T")
+                  val a = abs(v)
+                  if (!dms) return String.format(Locale.US, "%.4f°", a).replace('.', ',') + " " + hemi
+                  val d = floor(a).toInt()
+                  val mf = (a - d) * 60.0
+                  val m = floor(mf).toInt()
+                  val s = ((mf - m) * 60.0).roundToInt()
+                  return "$d°$m′$s″ $hemi"
+              }
+
+              private fun rad(d: Double) = Math.toRadians(d)
+              private fun deg(r: Double) = Math.toDegrees(r)
+              private fun mod(x: Double, m: Double): Double = ((x % m) + m) % m
+
+              /** Giờ mọc/lặn mặt trời (giờ địa phương), null nếu không có. */
+              fun sunTime(lat: Double, lon: Double, rise: Boolean): String? {
+                  val cal = Calendar.getInstance()
+                  val n = cal.get(Calendar.DAY_OF_YEAR)
+                  val lngHour = lon / 15.0
+                  val t = n + ((if (rise) 6.0 else 18.0) - lngHour) / 24.0
+                  val m = 0.9856 * t - 3.289
+                  val l = mod(m + 1.916 * sin(rad(m)) + 0.020 * sin(rad(2 * m)) + 282.634, 360.0)
+                  var ra = mod(deg(atan(0.91764 * tan(rad(l)))), 360.0)
+                  val lq = floor(l / 90.0) * 90.0
+                  val rq = floor(ra / 90.0) * 90.0
+                  ra = (ra + (lq - rq)) / 15.0
+                  val sinDec = 0.39782 * sin(rad(l))
+                  val cosDec = cos(asin(sinDec))
+                  val cosH = (cos(rad(90.833)) - sinDec * sin(rad(lat))) / (cosDec * cos(rad(lat)))
+                  if (cosH > 1.0 || cosH < -1.0) return null
+                  val h = (if (rise) 360.0 - deg(acos(cosH)) else deg(acos(cosH))) / 15.0
+                  val tt = h + ra - 0.06571 * t - 6.622
+                  val ut = mod(tt - lngHour, 24.0)
+                  val off = TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 3600000.0
+                  val local = mod(ut + off, 24.0)
+                  val hh = floor(local).toInt()
+                  val mm = ((local - hh) * 60.0).roundToInt()
+                  val h2 = if (mm == 60) (hh + 1) % 24 else hh
+                  val m2 = if (mm == 60) 0 else mm
+                  return String.format(Locale.US, "%02d:%02d", h2, m2)
+              }
+
+              /** Tuổi trăng (ngày) và tên pha. */
+              fun moon(): Pair<Double, String> {
+                  val synodic = 29.530588853
+                  val days = (System.currentTimeMillis() - 947182440000L) / 86400000.0
+                  val age = mod(days, synodic)
+                  val name = when {
+                      age < 1.85 -> "Trăng non"
+                      age < 5.54 -> "Trăng lưỡi liềm đầu tháng"
+                      age < 9.23 -> "Trăng bán nguyệt đầu tháng"
+                      age < 12.92 -> "Trăng khuyết (tăng dần)"
+                      age < 16.61 -> "Trăng tròn"
+                      age < 20.30 -> "Trăng khuyết (giảm dần)"
+                      age < 23.99 -> "Trăng bán nguyệt cuối tháng"
+                      age < 27.68 -> "Trăng lưỡi liềm cuối tháng"
+                      else -> "Trăng non"
+                  }
+                  return Pair(age, name)
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/MainActivity.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.SharedPreferences
+          import android.content.pm.PackageManager
+          import android.content.res.ColorStateList
+          import android.hardware.SensorManager
+          import android.os.Bundle
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.EditText
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+          import kotlin.math.abs
+          import kotlin.math.min
+          import kotlin.math.roundToInt
+
+          class MainActivity : Activity() {
+              private lateinit var hub: SensorHub
+              private lateinit var prefs: SharedPreferences
+              private lateinit var body: FrameLayout
+              private val tabViews = ArrayList<TextView>()
+              private val tabNames = arrayOf("La bàn", "Điểm", "Công cụ", "Cài đặt")
+              private var tab = 0
+              private val ticks = ArrayList<() -> Unit>()
+              private var lockAt: Float? = null
+              private var wasNorth = false
+              private var lastVib = 0L
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = C.BG
+                  window.navigationBarColor = C.BG
+                  prefs = getSharedPreferences("compass", MODE_PRIVATE)
+                  hub = SensorHub(this)
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setBackgroundColor(C.BG)
+                  body = FrameLayout(this)
+                  root.addView(body, LinearLayout.LayoutParams(-1, 0, 1f))
+                  root.addView(buildTabBar(), LinearLayout.LayoutParams(-1, dp(64)))
+                  setContentView(root)
+
+                  applyKeepOn()
+                  hub.onUpdate = { runTicks() }
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 1)
+                  }
+                  show(0)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  hub.start()
+                  if (!hub.hasSensor()) Toast.makeText(this, "Máy không có cảm biến la bàn", Toast.LENGTH_LONG).show()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  hub.stop()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  hub.startLocation()
+              }
+
+              // ---------- tiện ích ----------
+
+              private fun lp(w: Int, h: Int, weight: Float = 0f, l: Int = 0, t: Int = 0, r: Int = 0, b: Int = 0): LinearLayout.LayoutParams {
+                  val p = LinearLayout.LayoutParams(w, h, weight)
+                  p.setMargins(dp(l), dp(t), dp(r), dp(b))
+                  return p
+              }
+
+              private fun column(): LinearLayout {
+                  val c = LinearLayout(this)
+                  c.orientation = LinearLayout.VERTICAL
+                  return c
+              }
+
+              private fun row(): LinearLayout {
+                  val c = LinearLayout(this)
+                  c.orientation = LinearLayout.HORIZONTAL
+                  c.gravity = Gravity.CENTER_VERTICAL
+                  return c
+              }
+
+              private fun card(): LinearLayout {
+                  val c = column()
+                  c.background = roundBg(this, C.SURFACE, 14, C.LINE)
+                  c.setPadding(dp(14), dp(12), dp(14), dp(12))
+                  return c
+              }
+
+              private fun page(content: LinearLayout): View {
+                  content.setPadding(dp(20), dp(24), dp(20), dp(20))
+                  val sv = ScrollView(this)
+                  sv.isVerticalScrollBarEnabled = false
+                  sv.addView(content, ViewGroup.LayoutParams(-1, -2))
+                  return sv
+              }
+
+              private fun header(c: LinearLayout, title: String, sub: String) {
+                  c.addView(tv(this, title, 28f, C.TEXT, true))
+                  c.addView(tv(this, sub, 14f, C.MUTED), lp(-1, -2, t = 4, b = 14))
+              }
+
+              private fun button(text: String, filled: Boolean, onClick: () -> Unit): TextView {
+                  val b = tv(this, text, 15f, if (filled) C.DARKTEXT else C.TEXT, true)
+                  b.gravity = Gravity.CENTER
+                  b.background = if (filled) roundBg(this, C.AMBER, 14) else roundBg(this, 0, 14, C.LINE2)
+                  b.isClickable = true
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+              private fun trueMode(): Boolean = prefs.getBoolean("true", true) && hub.location != null
+              private fun dispHeading(): Float = if (trueMode()) (hub.heading + hub.declination + 360f) % 360f else hub.heading
+              private fun trueHeading(): Float = (hub.heading + (if (hub.location != null) hub.declination else 0f) + 360f) % 360f
+              private fun dms() = prefs.getBoolean("dms", false)
+
+              private fun applyKeepOn() {
+                  if (prefs.getBoolean("keep", true)) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              }
+
+              private fun runTicks() {
+                  for (t in ArrayList(ticks)) t()
+                  checkNorth()
+              }
+
+              @Suppress("DEPRECATION")
+              private fun checkNorth() {
+                  if (!hub.hasHeading) return
+                  val h = dispHeading()
+                  val near = min(h, 360f - h) < 2f
+                  val now = System.currentTimeMillis()
+                  if (near && !wasNorth && prefs.getBoolean("vib", true) && now - lastVib > 1500L) {
+                      lastVib = now
+                      try {
+                          (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE))
+                      } catch (e: Exception) {
+                      }
+                  }
+                  wasNorth = near
+              }
+
+              // ---------- thanh tab ----------
+
+              private fun buildTabBar(): View {
+                  val bar = LinearLayout(this)
+                  bar.orientation = LinearLayout.HORIZONTAL
+                  bar.setBackgroundColor(C.BG)
+                  for (i in tabNames.indices) {
+                      val t = tv(this, tabNames[i], 13f, C.MUTED, true)
+                      t.gravity = Gravity.CENTER
+                      t.isClickable = true
+                      t.setOnClickListener { show(i) }
+                      tabViews.add(t)
+                      bar.addView(t, LinearLayout.LayoutParams(0, -1, 1f))
+                  }
+                  val wrap = LinearLayout(this)
+                  wrap.orientation = LinearLayout.VERTICAL
+                  val line = View(this)
+                  line.setBackgroundColor(C.LINE)
+                  wrap.addView(line, LinearLayout.LayoutParams(-1, dp(1)))
+                  wrap.addView(bar, LinearLayout.LayoutParams(-1, -1))
+                  return wrap
+              }
+
+              private fun show(t: Int) {
+                  tab = t
+                  ticks.clear()
+                  body.removeAllViews()
+                  val v = when (t) {
+                      0 -> compassPage()
+                      1 -> pointsPage()
+                      2 -> toolsPage()
+                      else -> settingsPage()
+                  }
+                  body.addView(v, FrameLayout.LayoutParams(-1, -1))
+                  for (i in tabViews.indices) tabViews[i].setTextColor(if (i == t) C.AMBER else C.MUTED)
+                  runTicks()
+              }
+
+              // ---------- 1. La bàn ----------
+
+              private fun navPoint(): Pt? {
+                  val id = prefs.getLong("target", -1L)
+                  if (id < 0) return null
+                  return Points.all(this).firstOrNull { it.id == id }
+              }
+
+              private fun navDialAngle(): Float? {
+                  val loc = hub.location ?: return null
+                  val p = navPoint() ?: return null
+                  val b = Geo.distBearing(loc.latitude, loc.longitude, p.lat, p.lon)[1]
+                  return (b - (if (trueMode()) 0f else hub.declination) + 360f) % 360f
+              }
+
+              private fun markHere() {
+                  val loc = hub.location
+                  if (loc == null) {
+                      toast("Chưa có vị trí GPS. Hãy ra nơi thoáng và bật định vị.")
+                      return
+                  }
+                  val input = EditText(this)
+                  input.setText("Điểm ${Points.all(this).size + 1}")
+                  input.setSelectAllOnFocus(true)
+                  AlertDialog.Builder(this)
+                      .setTitle("Đánh dấu vị trí")
+                      .setView(input)
+                      .setPositiveButton("Lưu") { _, _ ->
+                          val n = input.text.toString().trim().ifEmpty { "Điểm mới" }
+                          Points.add(this, n, loc.latitude, loc.longitude)
+                          toast("Đã lưu \"$n\"")
+                          if (tab == 1) show(1)
+                      }
+                      .setNegativeButton("Hủy", null)
+                      .show()
+              }
+
+              private fun compassPage(): View {
+                  val col = column()
+
+                  val top = row()
+                  val left = column()
+                  left.addView(tv(this, "HƯỚNG BẮC", 12f, C.MUTED))
+                  val tvNorth = tv(this, "", 16f, C.TEXT, true)
+                  left.addView(tvNorth)
+                  top.addView(left, lp(0, -2, 1f))
+                  val pill = tv(this, "", 13f, C.GREEN, true)
+                  pill.setPadding(dp(12), dp(6), dp(12), dp(6))
+                  top.addView(pill)
+                  col.addView(top)
+
+                  val cv = CompassView(this)
+                  val cvp = lp(-2, -2, t = 18)
+                  cvp.gravity = Gravity.CENTER_HORIZONTAL
+                  col.addView(cv, cvp)
+
+                  val r1 = row()
+                  val r2 = row()
+                  val mLat = metric("Vĩ độ")
+                  val mLon = metric("Kinh độ")
+                  val mAlt = metric("Độ cao")
+                  val mMag = metric("Từ trường")
+                  r1.addView(mLat.first, lp(0, -2, 1f, r = 5))
+                  r1.addView(mLon.first, lp(0, -2, 1f, l = 5))
+                  r2.addView(mAlt.first, lp(0, -2, 1f, r = 5))
+                  r2.addView(mMag.first, lp(0, -2, 1f, l = 5))
+                  col.addView(r1, lp(-1, -2, t = 16))
+                  col.addView(r2, lp(-1, -2, t = 10))
+
+                  val btns = row()
+                  val lockBtn = button("Khóa hướng", false) {}
+                  lockBtn.setOnClickListener {
+                      lockAt = if (lockAt == null) dispHeading() else null
+                  }
+                  val markBtn = button("Đánh dấu vị trí", true) { markHere() }
+                  btns.addView(lockBtn, lp(0, dp(48), 1f, r = 5))
+                  btns.addView(markBtn, lp(0, dp(48), 1f, l = 5))
+                  col.addView(btns, lp(-1, -2, t = 14))
+
+                  ticks.add {
+                      val h = dispHeading()
+                      cv.heading = h
+                      cv.centerText = "${h.roundToInt() % 360}°"
+                      var sub = Geo.dirName(h)
+                      lockAt?.let {
+                          val d = ((h - it + 540f) % 360f) - 180f
+                          sub += "  (lệch ${if (d >= 0) "+" else ""}${d.roundToInt()}°)"
+                      }
+                      cv.subText = sub
+                      cv.lockAt = lockAt
+                      cv.navAt = navDialAngle()
+                      cv.invalidate()
+
+                      lockBtn.text = if (lockAt == null) "Khóa hướng" else "Mở khóa hướng"
+                      tvNorth.text = if (trueMode()) "Bắc thực" else "Bắc từ"
+                      val loc = hub.location
+                      if (loc == null) {
+                          pill.text = "Chưa có GPS"
+                          pill.setTextColor(C.AMBER)
+                          pill.background = roundBg(this, Color_amberDim, 20)
+                          mLat.second.text = "—"
+                          mLon.second.text = "—"
+                          mAlt.second.text = "—"
+                      } else {
+                          pill.text = "GPS ±${loc.accuracy.roundToInt()} m"
+                          pill.setTextColor(C.GREEN)
+                          pill.background = roundBg(this, Color_greenDim, 20)
+                          mLat.second.text = Geo.fmtCoord(loc.latitude, true, dms())
+                          mLon.second.text = Geo.fmtCoord(loc.longitude, false, dms())
+                          mAlt.second.text = if (loc.hasAltitude()) "${loc.altitude.roundToInt()} m" else "—"
+                      }
+                      mMag.second.text = "${hub.mag.roundToInt()} µT"
+                  }
+                  return page(col)
+              }
+
+              private val Color_greenDim = android.graphics.Color.parseColor("#10281F")
+              private val Color_amberDim = android.graphics.Color.parseColor("#2A200A")
+
+              private fun metric(label: String): Pair<LinearLayout, TextView> {
+                  val c = card()
+                  c.addView(tv(this, label, 12f, C.MUTED))
+                  val v = tv(this, "—", 17f, C.TEXT, true)
+                  c.addView(v, lp(-2, -2, t = 4))
+                  return Pair(c, v)
+              }
+
+              // ---------- 2. Điểm đánh dấu ----------
+
+              private fun pointsPage(): View {
+                  val col = column()
+                  header(col, "Điểm đánh dấu", "Lưu nơi quan trọng và để la bàn chỉ đường về.")
+
+                  val nav = row()
+                  nav.background = roundBg(this, android.graphics.Color.parseColor("#1C1708"), 18, C.AMBER)
+                  nav.setPadding(dp(14), dp(14), dp(14), dp(14))
+                  val arrow = ArrowView(this)
+                  nav.addView(arrow, lp(dp(76), dp(76), r = 14))
+                  val navCol = column()
+                  navCol.addView(tv(this, "ĐANG DẪN ĐƯỜNG", 12f, C.AMBER, true))
+                  val navName = tv(this, "", 22f, C.TEXT, true)
+                  navCol.addView(navName)
+                  val navInfo = tv(this, "", 14f, C.SUB)
+                  navCol.addView(navInfo)
+                  nav.addView(navCol, lp(0, -2, 1f))
+                  nav.visibility = View.GONE
+                  col.addView(nav, lp(-1, -2, b = 12))
+
+                  val listBox = column()
+                  col.addView(listBox)
+
+                  val add = button("+  Thêm điểm (vị trí hiện tại)", true) { markHere() }
+                  col.addView(add, lp(-1, dp(52), t = 14))
+
+                  class Ref(val p: Pt, val dist: TextView, val bearing: TextView)
+                  val refs = ArrayList<Ref>()
+                  var hadLoc = false
+
+                  fun fill() {
+                      listBox.removeAllViews()
+                      refs.clear()
+                      val loc = hub.location
+                      var pts = Points.all(this)
+                      if (loc != null) pts = pts.sortedBy { Geo.distBearing(loc.latitude, loc.longitude, it.lat, it.lon)[0] }.toMutableList()
+                      if (pts.isEmpty()) {
+                          listBox.addView(tv(this, "Chưa có điểm nào. Bấm \"Thêm điểm\" để lưu vị trí hiện tại.", 14f, C.MUTED), lp(-1, -2, t = 6))
+                      }
+                      val target = prefs.getLong("target", -1L)
+                      for (p in pts) {
+                          val r = row()
+                          r.background = roundBg(this, C.SURFACE, 14, if (p.id == target) C.AMBER else C.LINE)
+                          r.setPadding(dp(12), dp(12), dp(14), dp(12))
+                          val ini = tv(this, p.name.take(1).uppercase(), 16f, C.AMBER, true)
+                          ini.gravity = Gravity.CENTER
+                          ini.background = roundBg(this, android.graphics.Color.parseColor("#1F2833"), 12)
+                          r.addView(ini, lp(dp(40), dp(40), r = 12))
+                          val mid = column()
+                          mid.addView(tv(this, p.name, 16f, C.TEXT, true))
+                          mid.addView(tv(this, Geo.fmtCoord(p.lat, true, dms()) + ", " + Geo.fmtCoord(p.lon, false, dms()), 12f, C.MUTED))
+                          r.addView(mid, lp(0, -2, 1f))
+                          val right = column()
+                          right.gravity = Gravity.END
+                          val d = tv(this, "—", 15f, C.TEXT, true)
+                          val b = tv(this, "", 12f, C.MUTED)
+                          right.addView(d)
+                          right.addView(b)
+                          r.addView(right)
+                          r.isClickable = true
+                          r.setOnClickListener {
+                              prefs.edit().putLong("target", if (prefs.getLong("target", -1L) == p.id) -1L else p.id).apply()
+                              fill()
+                          }
+                          r.setOnLongClickListener {
+                              AlertDialog.Builder(this)
+                                  .setTitle(p.name)
+                                  .setMessage("Xóa điểm này?")
+                                  .setPositiveButton("Xóa") { _, _ ->
+                                      Points.remove(this, p.id)
+                                      fill()
+                                  }
+                                  .setNegativeButton("Hủy", null)
+                                  .show()
+                              true
+                          }
+                          listBox.addView(r, lp(-1, -2, b = 8))
+                          refs.add(Ref(p, d, b))
+                      }
+                      if (pts.isNotEmpty()) {
+                          listBox.addView(tv(this, "Chạm để dẫn đường · giữ lâu để xóa", 12f, C.MUTED), lp(-1, -2, t = 2))
+                      }
+                  }
+                  fill()
+
+                  ticks.add {
+                      val loc = hub.location
+                      if (loc != null && !hadLoc) {
+                          hadLoc = true
+                          fill()
+                      }
+                      if (loc != null) {
+                          for (r in refs) {
+                              val db = Geo.distBearing(loc.latitude, loc.longitude, r.p.lat, r.p.lon)
+                              r.dist.text = Geo.fmtDist(db[0])
+                              r.bearing.text = "${db[1].roundToInt() % 360}° ${Geo.dirName(db[1])}"
+                          }
+                      }
+                      val t = navPoint()
+                      if (t == null) {
+                          nav.visibility = View.GONE
+                      } else {
+                          nav.visibility = View.VISIBLE
+                          navName.text = t.name
+                          if (loc == null) {
+                              navInfo.text = "Đang chờ GPS…"
+                          } else {
+                              val db = Geo.distBearing(loc.latitude, loc.longitude, t.lat, t.lon)
+                              arrow.angle = db[1] - trueHeading()
+                              arrow.invalidate()
+                              navInfo.text = "Còn ${Geo.fmtDist(db[0])} · hướng ${db[1].roundToInt() % 360}° ${Geo.dirName(db[1])}"
+                          }
+                      }
+                  }
+                  return page(col)
+              }
+
+              // ---------- 3. Công cụ ----------
+
+              private fun toolsPage(): View {
+                  val col = column()
+                  header(col, "Công cụ", "Các cảm biến hữu ích khi đi đường.")
+
+                  val lvCard = row()
+                  lvCard.background = roundBg(this, C.SURFACE, 18, C.LINE)
+                  lvCard.setPadding(dp(16), dp(16), dp(16), dp(16))
+                  val level = LevelView(this)
+                  lvCard.addView(level, lp(dp(120), dp(120), r = 18))
+                  val lvCol = column()
+                  lvCol.addView(tv(this, "THƯỚC THỦY", 12f, C.MUTED, true))
+                  val lvVal = tv(this, "", 28f, C.TEXT, true)
+                  lvCol.addView(lvVal)
+                  val lvNote = tv(this, "", 13f, C.GREEN, true)
+                  lvCol.addView(lvNote)
+                  lvCard.addView(lvCol, lp(0, -2, 1f))
+                  col.addView(lvCard)
+
+                  val sun = toolCard("MẶT TRỜI")
+                  val moon = toolCard("MẶT TRĂNG")
+                  val mag = toolCard("TỪ TRƯỜNG")
+                  val tilt = toolCard("ĐỘ NGHIÊNG")
+                  val g1 = row()
+                  g1.addView(sun.first, lp(0, -2, 1f, r = 5))
+                  g1.addView(moon.first, lp(0, -2, 1f, l = 5))
+                  val g2 = row()
+                  g2.addView(mag.first, lp(0, -2, 1f, r = 5))
+                  g2.addView(tilt.first, lp(0, -2, 1f, l = 5))
+                  col.addView(g1, lp(-1, -2, t = 12))
+                  col.addView(g2, lp(-1, -2, t = 10))
+
+                  val cal = row()
+                  cal.background = roundBg(this, android.graphics.Color.parseColor("#10201C"), 16, android.graphics.Color.parseColor("#1F4D3F"))
+                  cal.setPadding(dp(16), dp(14), dp(16), dp(14))
+                  val calCol = column()
+                  calCol.addView(tv(this, "Hiệu chuẩn la bàn", 15f, C.TEXT, true))
+                  val calNote = tv(this, "", 13f, android.graphics.Color.parseColor("#A7D8C8"))
+                  calCol.addView(calNote)
+                  cal.addView(calCol, lp(0, -2, 1f))
+                  col.addView(cal, lp(-1, -2, t = 12))
+
+                  ticks.add {
+                      level.tiltX = hub.tiltX
+                      level.tiltY = hub.tiltY
+                      level.invalidate()
+                      lvVal.text = String.format(java.util.Locale.US, "%.1f° · %.1f°", abs(hub.tiltX), abs(hub.tiltY)).replace('.', ',')
+                      val flat = abs(hub.tiltX) < 1.5f && abs(hub.tiltY) < 1.5f
+                      lvNote.text = if (flat) "Gần như phẳng" else "Đang nghiêng"
+                      lvNote.setTextColor(if (flat) C.GREEN else C.AMBER)
+
+                      val loc = hub.location
+                      if (loc != null) {
+                          val rise = Geo.sunTime(loc.latitude, loc.longitude, true)
+                          val set = Geo.sunTime(loc.latitude, loc.longitude, false)
+                          sun.second.text = rise ?: "—"
+                          sun.third.text = if (set != null) "Mọc · lặn lúc $set" else "Không mọc/lặn hôm nay"
+                      } else {
+                          sun.second.text = "—"
+                          sun.third.text = "Cần vị trí GPS"
+                      }
+                      val m = Geo.moon()
+                      moon.second.text = "Ngày " + String.format(java.util.Locale.US, "%.1f", m.first).replace('.', ',')
+                      moon.third.text = m.second
+                      mag.second.text = "${hub.mag.roundToInt()} µT"
+                      mag.third.text = if (hub.mag in 25f..65f) "Bình thường" else "Bất thường (gần nam châm/kim loại?)"
+                      tilt.second.text = "${hub.tiltTotal.roundToInt()}°"
+                      tilt.third.text = "Góc so với mặt phẳng"
+
+                      val (txt, ok) = when (hub.accuracy) {
+                          SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> Pair("Độ chính xác: Cao", true)
+                          SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> Pair("Độ chính xác: Trung bình", true)
+                          SensorManager.SENSOR_STATUS_ACCURACY_LOW -> Pair("Độ chính xác: Thấp. Vẫy máy theo hình số 8.", false)
+                          else -> Pair("Chưa tin cậy. Vẫy máy theo hình số 8 để hiệu chuẩn.", false)
+                      }
+                      calNote.text = txt
+                      calNote.setTextColor(if (ok) android.graphics.Color.parseColor("#A7D8C8") else C.AMBER)
+                  }
+                  return page(col)
+              }
+
+              private class Triple3(val first: LinearLayout, val second: TextView, val third: TextView)
+
+              private fun toolCard(label: String): Triple3 {
+                  val c = card()
+                  c.setPadding(dp(14), dp(14), dp(14), dp(14))
+                  c.addView(tv(this, label, 12f, C.MUTED, true))
+                  val v = tv(this, "—", 22f, C.TEXT, true)
+                  c.addView(v, lp(-2, -2, t = 6))
+                  val n = tv(this, "", 13f, C.SUB)
+                  c.addView(n, lp(-2, -2, t = 4))
+                  return Triple3(c, v, n)
+              }
+
+              // ---------- 4. Cài đặt ----------
+
+              private fun segmented(a: String, b: String, firstSelected: Boolean, onPick: (Boolean) -> Unit): LinearLayout {
+                  val r = row()
+                  r.background = roundBg(this, C.BG, 12, C.LINE)
+                  r.setPadding(dp(4), dp(4), dp(4), dp(4))
+                  for (i in 0..1) {
+                      val sel = (i == 0) == firstSelected
+                      val t = tv(this, if (i == 0) a else b, 14f, if (sel) C.DARKTEXT else C.SUB, true)
+                      t.gravity = Gravity.CENTER
+                      if (sel) t.background = roundBg(this, C.AMBER, 9)
+                      t.isClickable = true
+                      t.setOnClickListener {
+                          onPick(i == 0)
+                          show(tab)
+                      }
+                      r.addView(t, lp(0, dp(40), 1f))
+                  }
+                  return r
+              }
+
+              private fun toggleRow(c: LinearLayout, label: String, key: String, def: Boolean, onChange: () -> Unit) {
+                  val r = row()
+                  r.setPadding(dp(14), dp(10), dp(14), dp(10))
+                  r.addView(tv(this, label, 15f, C.TEXT, true), lp(0, -2, 1f))
+                  val sw = Switch(this)
+                  sw.isChecked = prefs.getBoolean(key, def)
+                  val states = arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf())
+                  sw.trackTintList = ColorStateList(states, intArrayOf(C.AMBER, C.LINE2))
+                  sw.thumbTintList = ColorStateList(states, intArrayOf(android.graphics.Color.WHITE, C.TEXT))
+                  sw.setOnCheckedChangeListener { _, on ->
+                      prefs.edit().putBoolean(key, on).apply()
+                      onChange()
+                  }
+                  r.addView(sw)
+                  c.addView(r)
+              }
+
+              private fun settingsPage(): View {
+                  val col = column()
+                  header(col, "Cài đặt", "Tuỳ chỉnh la bàn theo cách bạn dùng.")
+
+                  col.addView(tv(this, "ĐO HƯỚNG", 13f, C.MUTED, true), lp(-1, -2, t = 6, b = 8))
+                  val c1 = card()
+                  c1.addView(tv(this, "Hướng Bắc", 15f, C.TEXT, true))
+                  c1.addView(segmented("Bắc thực", "Bắc từ", prefs.getBoolean("true", true)) { prefs.edit().putBoolean("true", it).apply() }, lp(-1, -2, t = 10))
+                  c1.addView(tv(this, "Bắc thực đã bù độ lệch từ trường theo vị trí GPS (cần có GPS).", 13f, C.MUTED), lp(-1, -2, t = 8))
+                  col.addView(c1)
+
+                  val c2 = card()
+                  c2.addView(tv(this, "Kiểu hiển thị tọa độ", 15f, C.TEXT, true))
+                  c2.addView(segmented("21,0285°", "21°1′43″", !prefs.getBoolean("dms", false)) { prefs.edit().putBoolean("dms", !it).apply() }, lp(-1, -2, t = 10))
+                  col.addView(c2, lp(-1, -2, t = 10))
+
+                  col.addView(tv(this, "TRẢI NGHIỆM", 13f, C.MUTED, true), lp(-1, -2, t = 20, b = 8))
+                  val c3 = card()
+                  c3.setPadding(0, dp(4), 0, dp(4))
+                  toggleRow(c3, "Rung khi hướng về Bắc", "vib", true) {}
+                  toggleRow(c3, "Giữ màn hình luôn sáng", "keep", true) { applyKeepOn() }
+                  col.addView(c3)
+
+                  col.addView(tv(this, "La Bàn 1.0 · Cảm biến: ${if (hub.hasSensor()) "có" else "không có"}", 12f, C.MUTED), lp(-1, -2, t = 20))
+                  return page(col)
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/Sensors.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import android.Manifest
+          import android.annotation.SuppressLint
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.hardware.GeomagneticField
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Bundle
+          import kotlin.math.abs
+          import kotlin.math.acos
+          import kotlin.math.asin
+          import kotlin.math.sqrt
+
+          class SensorHub(private val ctx: Context) : SensorEventListener, LocationListener {
+              private val sm = ctx.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+              private val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+
+              var heading = 0f          // hướng Bắc từ (độ)
+              var hasHeading = false
+              var tiltX = 0f
+              var tiltY = 0f
+              var tiltTotal = 0f
+              var mag = 0f              // µT
+              var accuracy = SensorManager.SENSOR_STATUS_UNRELIABLE
+              var location: Location? = null
+              var declination = 0f
+              var onUpdate: (() -> Unit)? = null
+
+              private val rot = sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+              private val acc = sm.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+              private val mg = sm.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+
+              private val gravity = FloatArray(3)
+              private val geomag = FloatArray(3)
+              private val rm = FloatArray(9)
+              private val rm2 = FloatArray(9)
+              private val ori = FloatArray(3)
+              private var haveGravity = false
+              private var last = 0L
+
+              fun hasSensor(): Boolean = (rot != null) || (acc != null && mg != null)
+
+              fun start() {
+                  rot?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+                  acc?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+                  mg?.let { sm.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME) }
+                  startLocation()
+              }
+
+              fun stop() {
+                  sm.unregisterListener(this)
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+              }
+
+              @SuppressLint("MissingPermission")
+              fun startLocation() {
+                  val ok = ctx.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                      ctx.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+                  if (!ok) return
+                  try {
+                      lm.removeUpdates(this)
+                  } catch (e: Exception) {
+                  }
+                  for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                      try {
+                          if (lm.isProviderEnabled(p)) {
+                              lm.requestLocationUpdates(p, 2000L, 1f, this)
+                              lm.getLastKnownLocation(p)?.let { updateLoc(it) }
+                          }
+                      } catch (e: Exception) {
+                      }
+                  }
+              }
+
+              private fun updateLoc(l: Location) {
+                  val cur = location
+                  if (cur == null || l.provider == LocationManager.GPS_PROVIDER || l.time - cur.time > 15000L || l.accuracy < cur.accuracy) {
+                      location = l
+                      declination = GeomagneticField(l.latitude.toFloat(), l.longitude.toFloat(), l.altitude.toFloat(), System.currentTimeMillis()).declination
+                  }
+              }
+
+              private fun computeHeading(r: FloatArray) {
+                  val flat = !haveGravity || abs(gravity[2]) > 6.5f
+                  if (flat) {
+                      SensorManager.getOrientation(r, ori)
+                  } else {
+                      SensorManager.remapCoordinateSystem(r, SensorManager.AXIS_X, SensorManager.AXIS_Z, rm2)
+                      SensorManager.getOrientation(rm2, ori)
+                  }
+                  val h = ((Math.toDegrees(ori[0].toDouble()).toFloat()) + 360f) % 360f
+                  if (!hasHeading) {
+                      heading = h
+                      hasHeading = true
+                  } else {
+                      val delta = ((h - heading + 540f) % 360f) - 180f
+                      heading = (heading + delta * 0.25f + 360f) % 360f
+                  }
+              }
+
+              override fun onSensorChanged(e: SensorEvent) {
+                  when (e.sensor.type) {
+                      Sensor.TYPE_ACCELEROMETER -> {
+                          for (i in 0..2) gravity[i] += (e.values[i] - gravity[i]) * (if (haveGravity) 0.15f else 1f)
+                          haveGravity = true
+                          val g = 9.81f
+                          tiltX = Math.toDegrees(asin((gravity[0] / g).coerceIn(-1f, 1f)).toDouble()).toFloat()
+                          tiltY = Math.toDegrees(asin((gravity[1] / g).coerceIn(-1f, 1f)).toDouble()).toFloat()
+                          val t = Math.toDegrees(acos((gravity[2] / g).coerceIn(-1f, 1f)).toDouble()).toFloat()
+                          tiltTotal = if (t > 90f) 180f - t else t
+                      }
+                      Sensor.TYPE_MAGNETIC_FIELD -> {
+                          mag = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2])
+                          if (rot == null && haveGravity) {
+                              System.arraycopy(e.values, 0, geomag, 0, 3)
+                              if (SensorManager.getRotationMatrix(rm, null, gravity, geomag)) computeHeading(rm)
+                          }
+                      }
+                      Sensor.TYPE_ROTATION_VECTOR -> {
+                          SensorManager.getRotationMatrixFromVector(rm, e.values)
+                          computeHeading(rm)
+                      }
+                  }
+                  val now = System.currentTimeMillis()
+                  if (now - last > 60L) {
+                      last = now
+                      onUpdate?.invoke()
+                  }
+              }
+
+              override fun onAccuracyChanged(s: Sensor, a: Int) {
+                  if (s.type == Sensor.TYPE_MAGNETIC_FIELD || s.type == Sensor.TYPE_ROTATION_VECTOR) accuracy = a
+              }
+
+              override fun onLocationChanged(l: Location) {
+                  updateLoc(l)
+              }
+
+              override fun onProviderEnabled(provider: String) {}
+              override fun onProviderDisabled(provider: String) {}
+
+              @Deprecated("Deprecated in Java")
+              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/java/vn/compass/app"
+          cat > "app/src/main/java/vn/compass/app/Ui.kt" <<'AMLICH_EOF'
+          package vn.compass.app
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.view.View
+          import android.widget.TextView
+          import kotlin.math.max
+          import kotlin.math.min
+
+          object C {
+              val BG = Color.parseColor("#0B0F14")
+              val SURFACE = Color.parseColor("#151B23")
+              val LINE = Color.parseColor("#27303B")
+              val LINE2 = Color.parseColor("#3B4757")
+              val TEXT = Color.parseColor("#F1F5F9")
+              val SUB = Color.parseColor("#CBD5E1")
+              val MUTED = Color.parseColor("#94A3B8")
+              val AMBER = Color.parseColor("#FBBF24")
+              val DARKTEXT = Color.parseColor("#1A1203")
+              val RED = Color.parseColor("#F87171")
+              val GREEN = Color.parseColor("#34D399")
+              val DIAL = Color.parseColor("#121821")
+          }
+
+          fun Context.dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+          fun roundBg(ctx: Context, color: Int, radiusDp: Int, stroke: Int = 0): GradientDrawable {
+              val d = GradientDrawable()
+              d.setColor(color)
+              d.cornerRadius = ctx.dp(radiusDp).toFloat()
+              if (stroke != 0) d.setStroke(ctx.dp(1), stroke)
+              return d
+          }
+
+          fun tv(ctx: Context, text: String, sp: Float, color: Int, bold: Boolean = false): TextView {
+              val t = TextView(ctx)
+              t.text = text
+              t.textSize = sp
+              t.setTextColor(color)
+              if (bold) t.setTypeface(t.typeface, Typeface.BOLD)
+              return t
+          }
+
+          class CompassView(ctx: Context) : View(ctx) {
+              var heading = 0f
+              var lockAt: Float? = null
+              var navAt: Float? = null
+              var centerText = "0°"
+              var subText = ""
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val names = mapOf(0 to "N", 90 to "E", 180 to "S", 270 to "W")
+
+              override fun onMeasure(w: Int, h: Int) {
+                  val s = min(MeasureSpec.getSize(w), context.dp(330))
+                  setMeasuredDimension(s, s)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val w = width.toFloat()
+                  val h = height.toFloat()
+                  val d = context.dp(1).toFloat()
+                  val cx = w / 2f
+                  val cy = h / 2f + 10 * d
+                  val r = min(w / 2f - 2 * d, h / 2f - 10 * d)
+
+                  p.style = Paint.Style.FILL
+                  p.color = C.DIAL
+                  c.drawCircle(cx, cy, r, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = d
+                  p.color = C.LINE
+                  c.drawCircle(cx, cy, r, p)
+
+                  c.save()
+                  c.rotate(-heading, cx, cy)
+                  // vạch chia
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  for (a in 0 until 360 step 5) {
+                      val major = a % 30 == 0
+                      p.color = if (a == 0) C.RED else if (major) C.TEXT else Color.parseColor("#64748B")
+                      p.strokeWidth = if (major) 2.2f * d else 1.6f * d
+                      val len = if (major) 16 * d else 9 * d
+                      c.save()
+                      c.rotate(a.toFloat(), cx, cy)
+                      c.drawLine(cx, cy - r + 8 * d, cx, cy - r + 8 * d + len, p)
+                      c.restore()
+                  }
+                  // chữ
+                  p.style = Paint.Style.FILL
+                  p.textAlign = Paint.Align.CENTER
+                  for (a in 0 until 360 step 30) {
+                      val card = names.containsKey(a)
+                      p.typeface = Typeface.DEFAULT_BOLD
+                      p.textSize = (if (card) 20 else 12) * d
+                      p.color = if (a == 0) C.RED else if (card) C.TEXT else C.MUTED
+                      c.save()
+                      c.rotate(a.toFloat(), cx, cy)
+                      c.drawText(names[a] ?: a.toString(), cx, cy - r + 46 * d + p.textSize * 0.35f, p)
+                      c.restore()
+                  }
+                  // dấu khóa hướng / dẫn đường
+                  lockAt?.let {
+                      c.save()
+                      c.rotate(it, cx, cy)
+                      p.color = C.AMBER
+                      c.drawCircle(cx, cy - r + 4 * d, 4.5f * d, p)
+                      c.restore()
+                  }
+                  navAt?.let {
+                      c.save()
+                      c.rotate(it, cx, cy)
+                      p.color = C.GREEN
+                      c.drawCircle(cx, cy - r + 4 * d, 4.5f * d, p)
+                      c.restore()
+                  }
+                  c.restore()
+
+                  // mũi tên cố định
+                  val tri = Path()
+                  tri.moveTo(cx - 10 * d, 0f)
+                  tri.lineTo(cx + 10 * d, 0f)
+                  tri.lineTo(cx, 17 * d)
+                  tri.close()
+                  p.style = Paint.Style.FILL
+                  p.color = C.AMBER
+                  c.drawPath(tri, p)
+
+                  // số độ ở giữa
+                  p.color = C.TEXT
+                  p.typeface = Typeface.DEFAULT_BOLD
+                  p.textSize = 58 * d
+                  c.drawText(centerText, cx, cy + 12 * d, p)
+                  p.color = C.AMBER
+                  p.textSize = 16 * d
+                  c.drawText(subText, cx, cy + 40 * d, p)
+              }
+          }
+
+          class LevelView(ctx: Context) : View(ctx) {
+              var tiltX = 0f
+              var tiltY = 0f
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(c: Canvas) {
+                  val d = context.dp(1).toFloat()
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(width, height) / 2f - 2 * d
+                  p.style = Paint.Style.FILL
+                  p.color = C.BG
+                  c.drawCircle(cx, cy, r, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = d
+                  p.color = C.LINE2
+                  c.drawCircle(cx, cy, r, p)
+                  c.drawCircle(cx, cy, r / 3f, p)
+                  p.color = C.LINE
+                  c.drawLine(cx, cy - r, cx, cy + r, p)
+                  c.drawLine(cx - r, cy, cx + r, cy, p)
+                  // bong bóng: lệch về phía cao hơn
+                  val maxDeg = 15f
+                  var bx = -tiltX / maxDeg
+                  var by = tiltY / maxDeg
+                  val len = Math.sqrt((bx * bx + by * by).toDouble()).toFloat()
+                  if (len > 1f) {
+                      bx /= len
+                      by /= len
+                  }
+                  val br = r / 4.2f
+                  val px = cx + bx * (r - br)
+                  val py = cy + by * (r - br)
+                  val flat = max(Math.abs(tiltX), Math.abs(tiltY)) < 1.5f
+                  p.style = Paint.Style.FILL
+                  p.color = if (flat) C.GREEN else C.AMBER
+                  p.alpha = 230
+                  c.drawCircle(px, py, br, p)
+                  p.alpha = 255
+              }
+          }
+
+          class ArrowView(ctx: Context) : View(ctx) {
+              var angle = 0f
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(c: Canvas) {
+                  val d = context.dp(1).toFloat()
+                  val cx = width / 2f
+                  val cy = height / 2f
+                  val r = min(width, height) / 2f - 1 * d
+                  p.style = Paint.Style.FILL
+                  p.color = C.BG
+                  c.drawCircle(cx, cy, r, p)
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = d
+                  p.color = C.LINE2
+                  c.drawCircle(cx, cy, r, p)
+                  c.save()
+                  c.rotate(angle, cx, cy)
+                  p.style = Paint.Style.STROKE
+                  p.strokeCap = Paint.Cap.ROUND
+                  p.strokeJoin = Paint.Join.ROUND
+                  p.strokeWidth = 4 * d
+                  p.color = C.AMBER
+                  c.drawLine(cx, cy + r * 0.55f, cx, cy - r * 0.55f, p)
+                  c.drawLine(cx, cy - r * 0.55f, cx - r * 0.32f, cy - r * 0.2f, p)
+                  c.drawLine(cx, cy - r * 0.55f, cx + r * 0.32f, cy - r * 0.2f, p)
+                  c.restore()
+              }
+          }
+          AMLICH_EOF
+          mkdir -p "app/src/main/res/drawable"
+          cat > "app/src/main/res/drawable/ic_launcher.xml" <<'AMLICH_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#0B0F14"
+                  android:pathData="M18,0 L90,0 A18,18 0 0 1 108,18 L108,90 A18,18 0 0 1 90,108 L18,108 A18,18 0 0 1 0,90 L0,18 A18,18 0 0 1 18,0 Z" />
+              <path
+                  android:fillColor="#121821"
+                  android:pathData="M54,14 A40,40 0 1 1 53.9,14 Z"
+                  android:strokeColor="#3B4757"
+                  android:strokeWidth="3" />
+              <path
+                  android:fillColor="#F87171"
+                  android:pathData="M54,22 L64,54 L44,54 Z" />
+              <path
+                  android:fillColor="#FBBF24"
+                  android:pathData="M54,86 L64,54 L44,54 Z" />
+              <path
+                  android:fillColor="#F1F5F9"
+                  android:pathData="M54,50 A4,4 0 1 1 53.9,50 Z" />
+          </vector>
+          AMLICH_EOF
+          mkdir -p "app/src/main/res/values"
+          cat > "app/src/main/res/values/strings.xml" <<'AMLICH_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">La Bàn</string>
+          </resources>
+          AMLICH_EOF
+          cat > "build.gradle" <<'AMLICH_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          AMLICH_EOF
+          cat > debug.keystore.b64 <<'AMLICH_EOF'
+          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
+          AMLICH_EOF
+          base64 -d debug.keystore.b64 > debug.keystore
+          cat > "gradle.properties" <<'AMLICH_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          AMLICH_EOF
+          cat > "settings.gradle" <<'AMLICH_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "LaBan"
+          include ':app'
+          AMLICH_EOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Build APK
+        working-directory: /home/runner/proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LaBan-APK
+          path: /home/runner/proj/app/build/outputs/apk/debug/app-debug.apk
